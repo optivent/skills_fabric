@@ -178,3 +178,109 @@ python -c "from skills_fabric.ingest.gitclone import GitCloner; GitCloner().clon
 # Generate skills
 python scripts/generate_skills.py --repo langgraph
 ```
+
+---
+
+## Kit-Spec Methodology
+
+### Source: BMAD-SPEC-KIT
+
+The kit-spec methodology is a **spec-driven development** approach from the BMAD framework. Instead of jumping to implementation, you first define clear specifications.
+
+### Core Principle
+
+> "Specifications are the contract between what you want and what you build.
+> Without specs, you are building based on assumptions."
+
+### The Flow
+
+```
+┌─────────────┐
+│    SPEC     │ Define what success looks like
+└──────┬──────┘
+       ▼
+┌─────────────┐
+│   STORIES   │ Break into user-facing stories
+└──────┬──────┘
+       ▼
+┌─────────────┐
+│    BUILD    │ Implement story by story
+└──────┬──────┘
+       ▼
+┌─────────────┐
+│   VERIFY    │ Check against original spec
+└─────────────┘
+```
+
+### Applied to Skills Fabric
+
+**SPEC (What we need):**
+- Generate Claude skills from source code
+- Zero hallucination: grounded in verified source
+- Multi-language: Python, TypeScript, any Tree-sitter lang
+- Graph storage: relationships between concepts/symbols/skills
+
+**STORIES (User-facing units):**
+1. As a developer, I can ingest a GitHub repository
+2. As a developer, I can link documentation to source code
+3. As a developer, I can generate skills with grounded questions
+4. As a developer, I can verify skills execute correctly
+5. As a developer, I can query my skill library
+
+**BUILD (Implementation):**
+- `ingest/gitclone.py` → Story 1
+- `link/proven_linker.py` → Story 2
+- `generate/skill_factory.py` → Story 3
+- `verify/sandbox.py` → Story 4
+- `store/kuzu_store.py` → Story 5
+
+**VERIFY (Check against spec):**
+- 48/48 tests pass
+- 433 PROVEN links verified
+- Real API calls (Context7, GLM-4.7)
+- Bubblewrap sandbox works
+
+### Kit-Spec in Practice
+
+**When adding a new feature:**
+
+1. **Write the spec first:**
+   ```markdown
+   ## Feature: Add LSP Integration
+   
+   ### Goal
+   Get type information for symbols via Language Server Protocol.
+   
+   ### Success Criteria
+   - [ ] LSP server starts for Python/TypeScript
+   - [ ] Can query hover info for symbols
+   - [ ] Type information stored in Symbol nodes
+   ```
+
+2. **Define the stories:**
+   ```markdown
+   - As a developer, I can start an LSP server for a project
+   - As a developer, I can get type info for a function
+   ```
+
+3. **Then implement:**
+   ```python
+   # analyze/lsp_client.py
+   class LSPClient:
+       def start_server(self, project_path): ...
+       def get_hover(self, file, line, col): ...
+   ```
+
+4. **Verify against spec:**
+   ```python
+   def test_lsp_integration():
+       client = LSPClient()
+       client.start_server(project)
+       info = client.get_hover("main.py", 10, 5)
+       assert info.type is not None
+   ```
+
+### The Key Insight
+
+> "Never write code until you can describe, in plain language,
+> what success looks like and how you will verify it."
