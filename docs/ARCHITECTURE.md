@@ -284,3 +284,148 @@ The kit-spec methodology is a **spec-driven development** approach from the BMAD
 
 > "Never write code until you can describe, in plain language,
 > what success looks like and how you will verify it."
+
+---
+
+## Hybrid Kit-Spec + BMAD Methodology
+
+### The Synthesis
+
+Kit-Spec and BMAD are complementary:
+- **Kit-Spec** = WHAT to build (spec-driven planning)
+- **BMAD C.O.R.E.** = HOW to build (execution principles)
+
+### Unified Flow
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    HYBRID METHODOLOGY                       │
+├────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ PHASE 1: SPEC (Kit-Spec + BMAD Reflection)          │   │
+│  │                                                      │   │
+│  │ 1. Define success criteria                           │   │
+│  │ 2. BMAD: What do we CLAIM to need?                  │   │
+│  │ 3. BMAD: What do we ACTUALLY need? (verify scope)   │   │
+│  │ 4. Identify gaps between claim and reality          │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ PHASE 2: STORIES (Kit-Spec + BMAD Collaboration)    │   │
+│  │                                                      │   │
+│  │ 1. Break spec into user-facing stories               │   │
+│  │ 2. BMAD: Ask user to prioritize/clarify             │   │
+│  │ 3. BMAD: Never assume, always confirm                │   │
+│  │ 4. Size each story (Quick/Method/Enterprise)        │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ PHASE 3: BUILD (Kit-Spec + BMAD Optimized Engine)   │   │
+│  │                                                      │   │
+│  │ 1. Implement story by story                          │   │
+│  │ 2. BMAD: No arbitrary limits (all files, concepts)  │   │
+│  │ 3. BMAD: Test each component independently          │   │
+│  │ 4. BMAD: Log actual results, not assumptions        │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ PHASE 4: VERIFY (Kit-Spec + BMAD Reflection)        │   │
+│  │                                                      │   │
+│  │ 1. Check implementation against spec                 │   │
+│  │ 2. BMAD: Run verification queries                   │   │
+│  │ 3. BMAD: Report honestly (gaps are findings)        │   │
+│  │ 4. BMAD: Document what works AND what doesnt        │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└────────────────────────────────────────────────────────────┘
+```
+
+### The Integration Matrix
+
+| Phase | Kit-Spec Focus | BMAD Principle |
+|-------|---------------|----------------|
+| SPEC | Define success | **Reflection**: Verify claims vs reality |
+| STORIES | User-facing units | **Collaboration**: Ask, dont assume |
+| BUILD | Implementation | **Optimized**: No limits, battle-tested |
+| VERIFY | Check against spec | **Engine**: Systematic verification |
+
+### Practical Example: Adding a New Data Source
+
+**SPEC Phase:**
+```markdown
+Goal: Add Reddit API as data source for Skills Fabric
+
+Success Criteria:
+- [ ] Can fetch top posts from subreddits
+- [ ] Can extract code snippets from posts
+- [ ] Code integrated into existing pipeline
+
+BMAD Reflection:
+- Claim: "We need Reddit for more examples"
+- Verify: Do we have enough examples already? (Check Context7 count)
+- Gap: Context7 has 2379 snippets, Reddit might add noise
+- Decision: Continue only if curated subreddits (r/Python, r/typescript)
+```
+
+**STORIES Phase:**
+```markdown
+Stories (with BMAD sizing):
+1. As a dev, I can authenticate with Reddit API (Quick Flow)
+2. As a dev, I can fetch posts from a subreddit (Quick Flow)
+3. As a dev, I can extract code blocks from posts (Method)
+4. As a dev, I can store Reddit content as Concepts (Method)
+
+BMAD Collaboration:
+→ Ask user: "Which subreddits should we prioritize?"
+→ Never assume which communities have valuable content
+```
+
+**BUILD Phase:**
+```python
+# ingest/reddit.py (BMAD: No limits)
+
+class RedditClient:
+    def fetch_posts(self, subreddit: str, limit: int = 100):
+        # BMAD: Use ALL posts up to limit, not [:3]
+        posts = self._api.get(f"/r/{subreddit}/top", limit=limit)
+        return posts  # All of them
+    
+    def extract_code(self, posts: list) -> list:
+        # BMAD: Process ALL posts, log actual count
+        code_blocks = []
+        for post in posts:
+            blocks = self._find_code_blocks(post.text)
+            code_blocks.extend(blocks)
+        
+        print(f"[Reddit] Extracted {len(code_blocks)} code blocks")
+        return code_blocks
+```
+
+**VERIFY Phase:**
+```python
+# BMAD: Run actual verification queries
+def test_reddit_integration():
+    client = RedditClient()
+    posts = client.fetch_posts("Python", limit=10)
+    
+    # BMAD: Report honestly
+    assert len(posts) == 10, f"Expected 10, got {len(posts)}"
+    
+    code = client.extract_code(posts)
+    print(f"Result: {len(code)} code blocks from {len(posts)} posts")
+    
+    # BMAD: Document gaps
+    if len(code) < 5:
+        print("WARNING: Low code extraction rate")
+```
+
+### The Hybrid Commitment
+
+1. **Start with spec** (Kit-Spec) + **verify scope** (BMAD Reflection)
+2. **Define stories** (Kit-Spec) + **confirm with user** (BMAD Collaboration)
+3. **Build without limits** (Kit-Spec stories) + **test each part** (BMAD Optimized)
+4. **Verify against spec** (Kit-Spec) + **report honestly** (BMAD Engine)
+
+> "The hybrid approach ensures you build the RIGHT thing (Kit-Spec)
+> in the RIGHT way (BMAD) with HONEST reporting (both)."
