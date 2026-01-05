@@ -119,35 +119,50 @@ class ProvenLinker:
         return [m for m in matches if m.confidence >= 0.5]
     
     def _create_link(self, concept_name: str, symbol_name: str) -> bool:
-        """Create a PROVEN relationship in the database."""
+        """Create a PROVEN relationship in the database.
+
+        Uses parameterized queries to prevent SQL/Cypher injection.
+        """
         try:
-            # Check if link already exists
-            res = self.db.execute(f"""
-                MATCH (c:Concept {{name: '{concept_name}'}})-[:PROVEN]->(s:Symbol {{name: '{symbol_name}'}})
+            # Check if link already exists (parameterized query)
+            res = self.db.execute(
+                """
+                MATCH (c:Concept {name: $concept_name})-[:PROVEN]->(s:Symbol {name: $symbol_name})
                 RETURN count(*)
-            """)
+                """,
+                {"concept_name": concept_name, "symbol_name": symbol_name}
+            )
             if res.has_next() and res.get_next()[0] > 0:
                 return False  # Already exists
-            
-            # Create link
-            self.db.execute(f"""
-                MATCH (c:Concept {{name: '{concept_name}'}}), (s:Symbol {{name: '{symbol_name}'}})
+
+            # Create link (parameterized query)
+            self.db.execute(
+                """
+                MATCH (c:Concept {name: $concept_name}), (s:Symbol {name: $symbol_name})
                 CREATE (c)-[:PROVEN]->(s)
-            """)
+                """,
+                {"concept_name": concept_name, "symbol_name": symbol_name}
+            )
             return True
         except Exception:
             return False
     
     def verify_links(self, sample_size: int = 10) -> dict:
-        """Verify a sample of PROVEN links point to valid files."""
+        """Verify a sample of PROVEN links point to valid files.
+
+        Uses parameterized queries to prevent injection.
+        """
         from ..ingest.gitclone import GitCloner
         cloner = GitCloner()
-        
-        res = self.db.execute(f"""
+
+        res = self.db.execute(
+            """
             MATCH (c:Concept)-[:PROVEN]->(s:Symbol)
             RETURN c.name, s.name, s.file_path
-            LIMIT {sample_size}
-        """)
+            LIMIT $sample_size
+            """,
+            {"sample_size": sample_size}
+        )
         
         valid = 0
         invalid = 0
