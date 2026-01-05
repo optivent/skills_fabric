@@ -429,3 +429,101 @@ def test_reddit_integration():
 
 > "The hybrid approach ensures you build the RIGHT thing (Kit-Spec)
 > in the RIGHT way (BMAD) with HONEST reporting (both)."
+
+---
+
+## Miessler PAI (Personal AI Infrastructure) Philosophy
+
+### Source: Daniel Miessler + development_environment_architecture.md
+
+The Miessler approach to Personal AI Infrastructure emphasizes **progressive isolation**, **spec-driven development**, and **preventing hallucination at boundaries**.
+
+### Core Principles
+
+> "The core challenge in AI development isnt choosing tools—its knowing WHEN to graduate between isolation levels without prematurely over-engineering or dangerously under-protecting stable work."
+
+### Progressive Isolation Model
+
+Start with minimum viable isolation, escalate only when needed:
+
+| Level | Tools | Use Case |
+|-------|-------|----------|
+| **L0: Global** | System Python | ❌ Never recommended |
+| **L1: Language** | uv, renv, fnm | ✅ Prototypes, experiments |
+| **L2: Container** | OrbStack, Docker | Multi-service, team sharing |
+| **L3: VM** | OrbStack VMs | Security isolation, GPU |
+| **L4: Cloud CDE** | DevPod, Codespaces | Collaboration, burst compute |
+
+**Key Insight:**
+> "Language-level isolation achieves 80% of the benefit with near-zero friction."
+
+### Spec-Driven Development Prevents Hallucination
+
+**The Critical Pattern:** Schema enforcement at every external boundary.
+
+```python
+from pydantic import BaseModel, Field
+
+class ExtractedEntity(BaseModel):
+    """Schema becomes both documentation and runtime contract."""
+    name: str = Field(..., description="Entity name (LLM uses this hint)")
+    confidence: float = Field(..., ge=0, le=1)
+    sources: list[str] = Field(..., min_length=1)  # Force citations
+```
+
+**Result:** Reduces hallucination-related failures from ~65% to near-zero.
+
+### Applied to Skills Fabric
+
+**L1 Isolation (Language Level):**
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e .
+```
+
+**Spec-Driven Skills:**
+```python
+class SkillRecord(BaseModel):
+    """Schema enforces grounded skills."""
+    question: str
+    code: str
+    source_url: str      # MUST point to real file
+    verified: bool       # MUST pass sandbox test
+```
+
+**Boundary Enforcement:**
+- Context7 API → JSON schema validation
+- GLM-4.7 → Structured output parsing
+- KuzuDB → Graph schema constraints
+- Bubblewrap → Sandbox execution boundary
+
+### The Trust Hierarchy (Miessler-Aligned)
+
+| Level | Content | Trust | Verification |
+|-------|---------|-------|--------------|
+| **HardContent** | AST, SCIP, regex | 100% | None needed |
+| **Verified Soft** | LLM + grounding | 95% | Schema + sandbox |
+| **Unverified** | Pure LLM output | 0% | REJECTED |
+
+### Practical Implementation
+
+1. **Never trust ungrounded LLM output**
+2. **Schema-validate all external boundaries**
+3. **Progressive isolation** (start L1, escalate as needed)
+4. **Force citations/sources** in all extracted data
+5. **Sandbox execution** for any code
+
+### The Sovereign Link Pattern
+
+Connect documentation to source code with verified links:
+
+```
+Documentation Claim → PROVEN → Source Reality
+     (CodeWiki)                  (Git Clone)
+         ↓
+    433 verified links
+         ↓
+    Zero hallucination skills
+```
+
+> "If you cant prove it points to real code, dont generate a skill from it."
