@@ -1,0 +1,9 @@
+services:
+  phoenix:
+    image: arizephoenix/phoenix
+    ports:
+      - "6006:6006"
+      - "4317:4317" # OTLP gRPC
+    volumes:
+      - ./phoenix_data:/data
+    restart: always
