@@ -1,0 +1,30 @@
+[project]
+name = "skills-fabric"
+version = "1.0.0"
+description = "Zero-hallucination Claude skill generation pipeline with CodeWiki, Context7, AST, and Bubblewrap integration"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "optivent"}]
+dependencies = [
+    "kuzu>=0.8.0",
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.2.0",
+    "gliner>=0.2.0",
+    "tree-sitter>=0.25.0",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-typescript>=0.23.0",
+    "requests>=2.31.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.5.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
