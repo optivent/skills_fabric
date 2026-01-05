@@ -20,7 +20,7 @@ Key Modules:
 - observability: Metrics, structured logging, distributed tracing
 - generate: Skill factory with LangGraph orchestration
 - verify: Sandbox execution, cross-layer verification
-- ingest: Source code and documentation ingestion
+- ingest: Source code and documentation ingestion (GitClone + CodeWiki)
 - link: PROVEN doc-to-code linking
 - store: KuzuDB skill storage
 
@@ -93,6 +93,13 @@ from .observability import (
     configure_logging,
 )
 
+# Ingest
+from .ingest import (
+    GitCloner,
+    CodeWikiCrawler,
+    IntegratedIngestor,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -124,4 +131,8 @@ __all__ = [
     "SkillsMetrics",
     "SkillsLogger",
     "configure_logging",
+    # Ingest
+    "GitCloner",
+    "CodeWikiCrawler",
+    "IntegratedIngestor",
 ]
