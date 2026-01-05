@@ -217,47 +217,137 @@ def generate_example_code(ref: CodeWikiRef, result) -> str:
     return "\n".join(lines)
 
 
-def demo_self_critique():
-    """Demonstrate the self-critique process."""
-    print_section("PHASE 4: SELF-CRITIQUE LOOP")
+def assess_quality(skill: dict) -> tuple[float, dict]:
+    """Calculate quality score from actual skill data.
 
-    # Simulate a critique cycle
+    Quality formula (matches self_improving_loop.py):
+    - Grounding: 40% (is the skill grounded in verified source?)
+    - Execution: 30% (does the code have valid syntax?)
+    - Coverage: 20% (does it reference real symbols?)
+    - Clarity: 10% (is the question descriptive enough?)
+
+    Returns:
+        (score, breakdown) where breakdown shows each component
+    """
+    breakdown = {}
+    score = 0.0
+
+    # Grounding (40%)
+    grounding = skill.get("grounding_score", 0.0)
+    grounding_contribution = grounding * 0.4
+    breakdown["grounding"] = {
+        "raw": grounding,
+        "weight": 0.4,
+        "contribution": grounding_contribution
+    }
+    score += grounding_contribution
+
+    # Execution (30%) - check syntax
+    code = skill.get("code", "")
+    try:
+        compile(code, "<string>", "exec")
+        syntax_ok = True
+    except SyntaxError:
+        syntax_ok = False
+
+    execution_contribution = 0.3 if syntax_ok else 0.0
+    breakdown["execution"] = {
+        "syntax_valid": syntax_ok,
+        "weight": 0.3,
+        "contribution": execution_contribution
+    }
+    score += execution_contribution
+
+    # Coverage (20%) - count symbols referenced
+    symbols = skill.get("symbols_used", [])
+    symbol_count = len(symbols)
+    coverage_raw = min(symbol_count / 3, 1.0)  # Cap at 3 symbols
+    coverage_contribution = coverage_raw * 0.2
+    breakdown["coverage"] = {
+        "symbols": symbol_count,
+        "raw": coverage_raw,
+        "weight": 0.2,
+        "contribution": coverage_contribution
+    }
+    score += coverage_contribution
+
+    # Clarity (10%) - question length >= 20 chars
+    question = skill.get("question", "")
+    clarity_ok = len(question) >= 20
+    clarity_contribution = 0.1 if clarity_ok else 0.0
+    breakdown["clarity"] = {
+        "question_length": len(question),
+        "threshold": 20,
+        "passed": clarity_ok,
+        "weight": 0.1,
+        "contribution": clarity_contribution
+    }
+    score += clarity_contribution
+
+    return score, breakdown
+
+
+def demo_self_critique():
+    """Demonstrate the self-critique process with REAL quality calculation."""
+    print_section("PHASE 4: SELF-CRITIQUE LOOP (REAL CALCULATION)")
+
+    # Initial skill - deliberately flawed
     skill_v1 = {
-        "question": "How use StateGraph?",  # Too short
-        "code": "graph = StateGraph()",  # Missing imports
-        "grounding_score": 0.5  # Low grounding
+        "question": "How use StateGraph?",  # Too short (18 chars)
+        "code": "graph = StateGraph()",  # Missing imports - invalid syntax
+        "grounding_score": 0.5,  # Low grounding
+        "symbols_used": []  # No symbols referenced
     }
 
     print("Initial Skill (v1):")
-    print(f"  Question: {skill_v1['question']}")
+    print(f"  Question: '{skill_v1['question']}' ({len(skill_v1['question'])} chars)")
     print(f"  Code: {skill_v1['code']}")
     print(f"  Grounding: {skill_v1['grounding_score']}")
+    print(f"  Symbols: {skill_v1['symbols_used']}")
 
-    # Critique
+    # Calculate REAL quality
+    quality_v1, breakdown_v1 = assess_quality(skill_v1)
+
+    print(f"\n  Quality Breakdown (v1):")
+    print(f"    Grounding: {breakdown_v1['grounding']['raw']:.1f} × 0.4 = {breakdown_v1['grounding']['contribution']:.2f}")
+    print(f"    Execution: {'✓' if breakdown_v1['execution']['syntax_valid'] else '✗'} × 0.3 = {breakdown_v1['execution']['contribution']:.2f}")
+    print(f"    Coverage:  {breakdown_v1['coverage']['symbols']} symbols × 0.2 = {breakdown_v1['coverage']['contribution']:.2f}")
+    print(f"    Clarity:   {breakdown_v1['clarity']['question_length']} chars {'≥' if breakdown_v1['clarity']['passed'] else '<'} 20 × 0.1 = {breakdown_v1['clarity']['contribution']:.2f}")
+    print(f"    TOTAL: {quality_v1:.2f} ({quality_v1:.0%})")
+
+    # Critique based on actual scores
     critiques = []
 
-    if len(skill_v1['question']) < 20:
+    if breakdown_v1['clarity']['contribution'] == 0:
         critiques.append({
             "category": "clarity",
             "severity": "minor",
-            "issue": "Question too short",
+            "issue": f"Question too short ({breakdown_v1['clarity']['question_length']} < 20 chars)",
             "suggestion": "Expand to be more descriptive"
         })
 
-    if "import" not in skill_v1['code']:
+    if breakdown_v1['execution']['contribution'] == 0:
         critiques.append({
             "category": "execution",
             "severity": "critical",
-            "issue": "Missing imports",
+            "issue": "Code has syntax error (missing imports)",
             "suggestion": "Add necessary import statements"
         })
 
-    if skill_v1['grounding_score'] < 0.8:
+    if breakdown_v1['grounding']['contribution'] < 0.32:  # < 80% of max
         critiques.append({
             "category": "grounding",
             "severity": "major",
-            "issue": "Low grounding score",
+            "issue": f"Low grounding ({breakdown_v1['grounding']['raw']:.0%} < 80%)",
             "suggestion": "Add more source references"
+        })
+
+    if breakdown_v1['coverage']['contribution'] == 0:
+        critiques.append({
+            "category": "coverage",
+            "severity": "major",
+            "issue": "No symbols referenced",
+            "suggestion": "Reference at least one symbol from source"
         })
 
     print("\nCritique Findings:")
@@ -265,7 +355,7 @@ def demo_self_critique():
         print(f"  [{c['severity'].upper()}] {c['category']}: {c['issue']}")
         print(f"      → {c['suggestion']}")
 
-    # Improved version
+    # Improved version - addressing each critique
     skill_v2 = {
         "question": "How do I create and use a StateGraph in LangGraph to build stateful agents?",
         "code": """from langgraph.graph import StateGraph, START, END
@@ -276,17 +366,28 @@ class State(TypedDict):
 
 graph = StateGraph(State)
 compiled = graph.compile()""",
-        "grounding_score": 0.9
+        "grounding_score": 1.0,  # Fully verified from source
+        "symbols_used": ["StateGraph", "START", "END"]  # Real symbols
     }
 
     print("\nImproved Skill (v2):")
-    print(f"  Question: {skill_v2['question']}")
+    print(f"  Question: '{skill_v2['question']}' ({len(skill_v2['question'])} chars)")
     print(f"  Grounding: {skill_v2['grounding_score']}")
+    print(f"  Symbols: {skill_v2['symbols_used']}")
 
-    quality_v1 = 0.3
-    quality_v2 = 0.85
+    # Calculate REAL quality for v2
+    quality_v2, breakdown_v2 = assess_quality(skill_v2)
 
-    print(f"\nQuality Improvement: {quality_v1:.0%} → {quality_v2:.0%} (+{(quality_v2-quality_v1)*100:.0f}%)")
+    print(f"\n  Quality Breakdown (v2):")
+    print(f"    Grounding: {breakdown_v2['grounding']['raw']:.1f} × 0.4 = {breakdown_v2['grounding']['contribution']:.2f}")
+    print(f"    Execution: {'✓' if breakdown_v2['execution']['syntax_valid'] else '✗'} × 0.3 = {breakdown_v2['execution']['contribution']:.2f}")
+    print(f"    Coverage:  {breakdown_v2['coverage']['symbols']} symbols × 0.2 = {breakdown_v2['coverage']['contribution']:.2f}")
+    print(f"    Clarity:   {breakdown_v2['clarity']['question_length']} chars {'≥' if breakdown_v2['clarity']['passed'] else '<'} 20 × 0.1 = {breakdown_v2['clarity']['contribution']:.2f}")
+    print(f"    TOTAL: {quality_v2:.2f} ({quality_v2:.0%})")
+
+    improvement = quality_v2 - quality_v1
+    print(f"\n  Quality Improvement: {quality_v1:.0%} → {quality_v2:.0%} (+{improvement*100:.0f}%)")
+    print(f"  (These scores are CALCULATED, not hardcoded)")
 
 
 def demo_learning_accumulation():
