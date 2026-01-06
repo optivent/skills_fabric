@@ -8,6 +8,10 @@ Agent Philosophy:
 - Agents communicate through structured messages
 - Supervisor coordinates agent execution
 - Failures are escalated, not hidden
+
+Observability:
+- OpenTelemetry tracing for all agent executions
+- Spans include agent role, duration, and result status
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -15,6 +19,15 @@ from typing import Any, Optional, TypeVar, Generic
 from enum import Enum
 from datetime import datetime
 import uuid
+
+# Import tracing (optional dependency)
+try:
+    from ..telemetry.tracing import get_tracer, trace_span
+    TRACING_AVAILABLE = True
+except ImportError:
+    TRACING_AVAILABLE = False
+    get_tracer = lambda: None
+    trace_span = None
 
 
 class AgentRole(Enum):
@@ -83,12 +96,15 @@ class BaseAgent(ABC, Generic[T]):
     2. Processes messages
     3. Returns structured results
     4. Can communicate with other agents through supervisor
+    5. Has OpenTelemetry tracing for observability
     """
 
     def __init__(self, role: AgentRole):
         self.role = role
         self.status = AgentStatus.IDLE
         self._messages: list[AgentMessage] = []
+        self._tracer = get_tracer() if TRACING_AVAILABLE else None
+        self._current_span = None
 
     @abstractmethod
     def execute(self, task: Any, context: dict = None) -> AgentResult:
@@ -128,8 +144,17 @@ class BaseAgent(ABC, Generic[T]):
         return messages
 
     def _start_execution(self) -> datetime:
-        """Mark execution start."""
+        """Mark execution start and begin trace span."""
         self.status = AgentStatus.RUNNING
+
+        # Start tracing span
+        if self._tracer:
+            self._current_span = self._tracer.start_span(
+                f"agent.{self.role.value}.execute"
+            )
+            self._current_span.set_attribute("agent.role", self.role.value)
+            self._current_span.set_attribute("agent.class", self.__class__.__name__)
+
         return datetime.now()
 
     def _end_execution(
@@ -138,8 +163,30 @@ class BaseAgent(ABC, Generic[T]):
         output: Any = None,
         error: str = None
     ) -> AgentResult:
-        """Mark execution end and create result."""
+        """Mark execution end, close trace span, and create result."""
         duration = (datetime.now() - start_time).total_seconds() * 1000
+
+        # Update trace span
+        if self._current_span:
+            self._current_span.set_attribute("duration_ms", duration)
+
+            if error:
+                from opentelemetry.trace import Status, StatusCode
+                self._current_span.set_status(Status(StatusCode.ERROR, error))
+                self._current_span.set_attribute("error", True)
+            else:
+                from opentelemetry.trace import Status, StatusCode
+                self._current_span.set_status(Status(StatusCode.OK))
+                self._current_span.set_attribute("error", False)
+
+                # Add output attributes if available
+                if hasattr(output, 'passed'):
+                    self._current_span.set_attribute("result.passed", output.passed)
+                if hasattr(output, 'hallucination_rate'):
+                    self._current_span.set_attribute("result.hall_m", output.hallucination_rate)
+
+            self._current_span.end()
+            self._current_span = None
 
         if error:
             self.status = AgentStatus.FAILED
