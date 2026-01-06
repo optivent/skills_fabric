@@ -122,6 +122,7 @@ class DirectDependencyRetriever:
         Supports formats:
         1. Markdown links: [`SymbolName`](github_url#L123)
         2. Table format: | Symbol | Type | Line | Signature |
+        3. Simple format: ### `file.py` + - Line N: `Symbol` (type)
         """
         index = {}
 
@@ -179,10 +180,44 @@ class DirectDependencyRetriever:
                 index[key] = []
             index[key].append(entry)
 
-        # Pattern 2: Table format (fallback)
+        # Pattern 2: Simple format (Docling style)
+        # ### `file/path.py`
+        # - Line 19: `SymbolName` (class)
+        current_file = None
+        simple_file_pattern = r'^###\s+`([^`]+)`'
+        simple_symbol_pattern = r'^-\s+Line\s+(\d+):\s+`([^`]+)`\s+\((\w+)\)'
+
+        for line in content.split('\n'):
+            # Check for file header: ### `path/to/file.py`
+            file_match = re.match(simple_file_pattern, line)
+            if file_match:
+                current_file = file_match.group(1)
+                continue
+
+            # Check for symbol: - Line N: `Symbol` (type)
+            if current_file:
+                symbol_match = re.match(simple_symbol_pattern, line)
+                if symbol_match:
+                    line_num = int(symbol_match.group(1))
+                    symbol = symbol_match.group(2)
+                    sym_type = symbol_match.group(3)
+
+                    entry = {
+                        "symbol": symbol,
+                        "type": sym_type,
+                        "line": line_num,
+                        "file": current_file,
+                    }
+
+                    key = symbol.lower()
+                    if key not in index:
+                        index[key] = []
+                    index[key].append(entry)
+
+        # Pattern 3: Table format (fallback)
         current_file = None
         for line in content.split('\n'):
-            if line.startswith('## ') and not line.startswith('## Symbols'):
+            if line.startswith('## ') and not line.startswith('## Symbols') and not line.startswith('## By'):
                 current_file = line[3:].strip()
                 continue
 
@@ -327,6 +362,16 @@ class DirectDependencyRetriever:
             return CodeElement(
                 source_ref=source_ref,
                 content=f"# {symbol}\n# Source: {url}",
+                context="",
+            )
+
+        # Trust entries from symbol catalog with file path and line number
+        # (they were extracted from actual source code)
+        if file_path and line_num > 0:
+            source_ref.validated = True
+            return CodeElement(
+                source_ref=source_ref,
+                content=f"# {symbol}\n# Location: {file_path}:{line_num}",
                 context="",
             )
 
