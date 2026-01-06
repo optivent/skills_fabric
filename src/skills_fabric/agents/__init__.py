@@ -37,6 +37,7 @@ from .miner import MinerAgent, MiningTask, MiningResult
 from .linker import LinkerAgent, LinkingTask, LinkingResult
 from .verifier import VerifierAgent, VerificationTask, VerificationResult
 from .writer import WriterAgent, WritingTask, WritingResult
+from .auditor import AuditorAgent, AuditTask, AuditResult, Claim, ClaimVerification
 from .supervisor import (
     SupervisorAgent,
     SupervisorResult,
@@ -68,6 +69,12 @@ __all__ = [
     "WriterAgent",
     "WritingTask",
     "WritingResult",
+    # Auditor (Zero-Hallucination)
+    "AuditorAgent",
+    "AuditTask",
+    "AuditResult",
+    "Claim",
+    "ClaimVerification",
     # Supervisor
     "SupervisorAgent",
     "SupervisorResult",

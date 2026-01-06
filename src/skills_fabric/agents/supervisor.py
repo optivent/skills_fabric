@@ -28,6 +28,7 @@ from .miner import MinerAgent, MiningTask
 from .linker import LinkerAgent, LinkingTask
 from .verifier import VerifierAgent, VerificationTask
 from .writer import WriterAgent, WritingTask
+from .auditor import AuditorAgent, AuditTask
 
 
 class WorkflowStage(Enum):
@@ -36,6 +37,7 @@ class WorkflowStage(Enum):
     MINING = "mining"
     LINKING = "linking"
     WRITING = "writing"
+    AUDITING = "auditing"      # Zero-hallucination audit
     VERIFYING = "verifying"
     STORING = "storing"
     COMPLETE = "complete"
@@ -48,18 +50,22 @@ class WorkflowState:
     stage: WorkflowStage = WorkflowStage.INIT
     library_name: str = ""
     repo_path: str = ""
+    codewiki_path: str = ""  # Path to CodeWiki output
 
     # Agent outputs
     mined_symbols: list[dict] = field(default_factory=list)
     mined_snippets: list[dict] = field(default_factory=list)
     proven_links: list[dict] = field(default_factory=list)
     skills: list[Any] = field(default_factory=list)
+    audited_skills: list[Any] = field(default_factory=list)  # After audit
     verified_skills: list[Any] = field(default_factory=list)
 
     # Metrics
     skills_created: int = 0
+    skills_audited: int = 0
     skills_verified: int = 0
     skills_rejected: int = 0
+    hallucination_rate: float = 0.0
 
     # Messages
     messages: list[AgentMessage] = field(default_factory=list)
@@ -100,6 +106,7 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
         self.linker = LinkerAgent()
         self.verifier = VerifierAgent()
         self.writer = WriterAgent()
+        self.auditor = AuditorAgent()  # Zero-hallucination auditor
 
         # Agent configs
         self.configs = {
@@ -107,6 +114,7 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
             AgentRole.LINKER: AgentConfig.for_role(AgentRole.LINKER),
             AgentRole.VERIFIER: AgentConfig.for_role(AgentRole.VERIFIER),
             AgentRole.WRITER: AgentConfig.for_role(AgentRole.WRITER),
+            AgentRole.AUDITOR: AgentConfig.for_role(AgentRole.AUDITOR),
         }
 
     def execute(
@@ -129,7 +137,8 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
             # Initialize state
             state = WorkflowState(
                 library_name=task.get('library_name', ''),
-                repo_path=task.get('repo_path', '')
+                repo_path=task.get('repo_path', ''),
+                codewiki_path=task.get('codewiki_path', ''),
             )
 
             agent_results = {}
@@ -167,16 +176,28 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
                 else:
                     self._collect_messages(writing_result)
 
-            # Stage 4: Verifying
+            # Stage 4: Auditing (Zero-Hallucination)
             if state.stage != WorkflowStage.FAILED and state.skills:
-                print(f"[Supervisor] Stage 4: Verifying {len(state.skills)} skills...")
+                print(f"[Supervisor] Stage 4: Auditing {len(state.skills)} skills (zero-hallucination)...")
+                state, audit_result = self._run_auditing(state)
+                agent_results[AgentRole.AUDITOR] = audit_result
+
+                if audit_result.success:
+                    self._collect_messages(audit_result)
+                    print(f"  Hall_m rate: {state.hallucination_rate:.4f}")
+                else:
+                    state.errors.append(f"Auditing warning: {audit_result.error}")
+
+            # Stage 5: Verifying
+            if state.stage != WorkflowStage.FAILED and state.audited_skills:
+                print(f"[Supervisor] Stage 5: Verifying {len(state.audited_skills)} audited skills...")
                 state, verify_result = self._run_verification(state)
                 agent_results[AgentRole.VERIFIER] = verify_result
 
                 if verify_result.success:
                     self._collect_messages(verify_result)
 
-            # Stage 5: Storing
+            # Stage 6: Storing
             if state.verified_skills:
                 print(f"[Supervisor] Stage 5: Storing {len(state.verified_skills)} verified skills...")
                 state = self._run_storing(state)
@@ -304,17 +325,85 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
             output={'skills_count': len(skills)}
         )
 
+    def _run_auditing(
+        self,
+        state: WorkflowState
+    ) -> tuple[WorkflowState, AgentResult]:
+        """Run zero-hallucination auditing stage."""
+        from pathlib import Path
+        from ..verify.ddr import SourceRef
+
+        state.stage = WorkflowStage.AUDITING
+
+        audited = []
+        rejected = 0
+        total_hall_rate = 0.0
+
+        codewiki_path = Path(state.codewiki_path) if state.codewiki_path else None
+        repo_path = Path(state.repo_path) if state.repo_path else None
+
+        for skill in state.skills:
+            # Build source refs from proven links
+            source_refs = []
+            for link in state.proven_links:
+                if link.get('symbol_name') in str(getattr(skill, 'content', '')):
+                    source_refs.append(SourceRef(
+                        symbol_name=link.get('symbol_name', ''),
+                        file_path=link.get('file_path', ''),
+                        line_number=link.get('line_number', 0),
+                        validated=True,
+                    ))
+
+            # Create audit task
+            content = getattr(skill, 'content', str(skill))
+            task = AuditTask(
+                content=content,
+                source_refs=source_refs,
+                codewiki_path=codewiki_path,
+                repo_path=repo_path,
+                strict_mode=False,  # Allow up to 2% hallucination
+            )
+
+            result = self.auditor.execute(task)
+
+            if result.success and result.output.passed:
+                skill.audited = True
+                skill.hallucination_rate = result.output.hallucination_rate
+                audited.append(skill)
+                total_hall_rate += result.output.hallucination_rate
+            else:
+                rejected += 1
+
+        state.audited_skills = audited
+        state.skills_audited = len(audited)
+        state.hallucination_rate = total_hall_rate / len(audited) if audited else 0.0
+
+        print(f"  Audited: {len(audited)}, Rejected: {rejected}")
+
+        return state, AgentResult(
+            agent=AgentRole.AUDITOR,
+            status=AgentStatus.SUCCESS,
+            output={
+                'audited': len(audited),
+                'rejected': rejected,
+                'hallucination_rate': state.hallucination_rate
+            }
+        )
+
     def _run_verification(
         self,
         state: WorkflowState
     ) -> tuple[WorkflowState, AgentResult]:
-        """Run verification stage."""
+        """Run verification stage on audited skills."""
         state.stage = WorkflowStage.VERIFYING
 
         verified = []
         rejected = 0
 
-        for skill in state.skills:
+        # Use audited_skills (already passed zero-hallucination check)
+        skills_to_verify = state.audited_skills or state.skills
+
+        for skill in skills_to_verify:
             task = VerificationTask(skill=skill)
             result = self.verifier.execute(task)
 
@@ -326,7 +415,7 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
 
         state.verified_skills = verified
         state.skills_verified = len(verified)
-        state.skills_rejected = rejected
+        state.skills_rejected += rejected  # Add to any already rejected in audit
 
         print(f"  Verified: {len(verified)}, Rejected: {rejected}")
 
@@ -365,20 +454,23 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
     def run_workflow(
         self,
         library_name: str,
-        repo_path: str
+        repo_path: str,
+        codewiki_path: str = None
     ) -> SupervisorResult:
         """Convenience method to run full workflow.
 
         Args:
             library_name: Name of the library
             repo_path: Path to the repository
+            codewiki_path: Path to CodeWiki output (for zero-hallucination)
 
         Returns:
             SupervisorResult with workflow outcome
         """
         result = self.execute({
             'library_name': library_name,
-            'repo_path': repo_path
+            'repo_path': repo_path,
+            'codewiki_path': codewiki_path or '',
         })
 
         if result.success:

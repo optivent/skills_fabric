@@ -25,6 +25,7 @@ class AgentRole(Enum):
     VERIFIER = "verifier"      # Verifies trust hierarchy
     WRITER = "writer"          # Generates skill output
     RESEARCHER = "researcher"   # Fetches documentation
+    AUDITOR = "auditor"        # Verifies content against source (zero-hallucination)
 
 
 class AgentStatus(Enum):
@@ -177,6 +178,7 @@ class AgentConfig:
         AgentRole.WRITER: "sonnet",    # Structured output
         AgentRole.RESEARCHER: "haiku", # Quick fetches
         AgentRole.SUPERVISOR: "sonnet", # Orchestration
+        AgentRole.AUDITOR: "opus",     # Critical verification (zero-hallucination)
     }
 
     @classmethod
