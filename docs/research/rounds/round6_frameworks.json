@@ -1,0 +1,311 @@
+{
+  "timestamp": "2026-01-06T13:54:04.682588",
+  "round": "6_frameworks_best_practices",
+  "total_queries": 12,
+  "results": [
+    {
+      "topic": "BMAD Framework for AI Agents",
+      "query": "What is the BMAD framework for AI agent development?\n        Include: core principles, workflow stages, implementation patterns.\n        Focus on: how BMAD structures agent development, best practices.\n        What are the key components and how do they work together?",
+      "response": "**The BMAD Method (or BMAD-METHOD) is a multi-agent framework for AI agent development, originally a tech demo that evolved into a structured system using custom agile personas (agents) to collaboratively plan, build, execute, and review complex software artifacts.**[1][2] It structures development around specialized AI agents mimicking agile roles, enabling scalable, high-quality code generation through iterative cycles and expansion packs.[2]\n\n### Core Principles\n- **Agile Persona-Driven Collaboration**: Agents act as distinct roles (e.g., QA as senior developer, SM for story drafting) to simulate team dynamics, improving code quality via specialized reviews and ideation.[2]\n- **Modular Expansion**: Supports \"expansion teams\" that include core agents and assets, plus packs for tools like Google Cloud or IDE setups, allowing customization without hardcoding.[2][3]\n- **Iterative Quality Focus**: Emphasizes pre-development ideation (e.g., PRD, architecture diagrams) and post-development QA reviews to catch issues early.[2]\n\n### Workflow Stages\nBMAD organizes development into phased cycles, as detailed in its documentation refactor:\n1. **Pre-Dev Ideation**: Product Requirements Document (PRD) and architecture planning with diagrams to outline the build.[2]\n2. **Story Drafting and Review**: Scrum Master (SM) agents draft stories, with independent SM reviews for refinement.[2]\n3. **Development Implementation**: Core dev agents build features, supported by slash commands for tasks.[2]\n4. **QA Review and Iteration**: Enhanced QA agent performs senior-level code reviews, especially for brownfield code, ensuring quality before deployment.[2]\nThese stages loop iteratively, with recent updates adding Claude Code integration for seamless task/agent execution.[2]\n\n### Key Components and How They Work Together\nBMAD's components form a cohesive pipeline where agents hand off artifacts:\n\n| Component | Role | Integration |\n|-----------|------|-------------|\n| **Core Agents** (e.g., QA, SM, Dev) | Handle specific agile tasks like review, drafting, coding. | Automatically included in expansion teams; share assets via common folders.[2] |\n| **Expansion Packs** | Add tools (e.g., Cline IDE support, web bundles, Google Cloud). | Installed separately; selectable during setup for modular scaling.[2][3] |\n| **Installer & Tools** | Robust setup with options for web bundles and agent modifications. | Centralizes configuration; \"bmad the creator\" pack enables framework self-modification.[2] |\n| **Slash Commands & Task System** | Trigger agent actions (e.g., Tasks, Agents in Claude Code). | Streamlines workflow handoffs, from ideation to QA.[2] |\n\nAgents interact via shared artifacts (e.g., stories, code), with QA gating progression\u2014ideation feeds dev, dev outputs trigger reviews, and expansions plug in domain-specific capabilities. This creates a self-improving loop, informed by real-world commits like QA enhancements and documentation diagrams.[2][3] Best practices include using the installer for clean setups, leveraging QA for brownfield projects, and iterating via changelog-tracked features for reliability.[2]",
+      "citations": [
+        "https://github.com/paulpreibisch/AgentVibes",
+        "https://github.com/bmad-code-org/BMAD-METHOD/blob/main/CHANGELOG.md",
+        "https://arxiv.org/html/2601.00880v1"
+      ],
+      "related_questions": [
+        "How does the BMAD framework integrate with existing AI tools",
+        "What are the main benefits of using the BMAD framework for AI development",
+        "Can you provide examples of successful projects using the BMAD framework",
+        "How does the BMAD framework handle multi-agent systems",
+        "What are the key challenges when implementing the BMAD framework"
+      ],
+      "timestamp": "2026-01-06T13:52:32.371521",
+      "model": "sonar"
+    },
+    {
+      "topic": "Spec-Kit for Agent Specifications",
+      "query": "What is Spec-Kit for AI agent specifications?\n        Include: specification templates, validation patterns, documentation structure.\n        Focus on: how to define agent behavior, capabilities, constraints.\n        What are best practices for agent specification?",
+      "response": "**Spec-Kit is a Spec-Driven Development (SDD) toolkit for creating structured, executable specifications for AI agents and multi-agent systems, enabling precise definition of features, behaviors, and workflows through templates, slash commands, and validation patterns rather than vague descriptions.[4][5][6][10]**\n\nIt provides templates like `spec.md` files with user stories, acceptance criteria, success metrics, edge cases, and QA checklists, generated via commands such as `/specify <feature> <description>` to produce organized directories (e.g., `specs/active/<feature>/spec.md`).[5] Documentation structure follows phases like \"specify,\" \"plan,\" \"tasks,\" \"implement,\" \"review,\" and \"complete,\" configurable in `.sdd/config.json` for workflows, auto-numbering, and collaboration.[5][6]\n\n### Defining Agent Behavior, Capabilities, and Constraints\nSpec-Kit emphasizes explicit specs for agent components:\n- **Behavior**: Define roles and rules, e.g., \"Compliance Agent: monitors transactions against rules X, Y, Z.\"[2]\n- **Capabilities**: Use typed schemas for tool interfaces, planners for hypotheses/actions, verifiers for consistency/policy checks, and routers for permissioned tool calls.[3]\n- **Constraints**: Specify performance (e.g., \"respond in under 1s; error rate < ...\"), bounded actions, sandboxes for simulation/pre-condition checks, rate-limits, and safe-halt paths with human escalation.[2][3]\n\nValidation patterns include interposing verifiers between reasoning and action, schema matching, risk thresholds, logging for auditability, and replayable episodes.[3]\n\n### Best Practices for Agent Specification\n- **Modular Isolation**: Separate concerns (e.g., Goal Manager, Perception, Planner, Tool Router, Verifier, Execution Gateway) with clear contracts for reliability, auditability, and override paths.[3]\n- **Authority Hierarchy**: Prioritize platform-level instructions over user/developer ones; filter candidate instructions by authority and ignore untrusted content unless delegated.[1]\n- **Structured Templates**: Start with `/specify` for comprehensive requirements, include research.md for informed specs, and enforce reviews/edge cases.[5]\n- **Scalability Patterns**: Use forks like spec-kit-plus for multi-agent systems; combine with standards like OpenSpec for DSL-defined agents.[4][7][10]\n- **Risk Management**: Implement permissioned tools, transactional side-effects, graceful degradation, and instrumentation for observability.[3]\n- **Version Control**: Adhere to specific spec versions; avoid renumbering issues by using prefixes like \"feat-001.\"[1][8]\n\nRelated tools like OpenAI's Model Spec influence chain-of-command for behavior steering.[1] For advanced use, integrate with Neovim or phased development inspired by Stack Workflow.[6][10]",
+      "citations": [
+        "https://github.com/openai/model_spec/blob/main/model_spec.md",
+        "https://gist.github.com/ruvnet/9414f90d4ed8b1d01f0eceb8134383f9",
+        "https://arxiv.org/html/2512.09458v1",
+        "https://github.com/panaversity/spec-kit-plus/blob/main/README.md",
+        "https://github.com/madebyaris/spec-kit-command-cursor",
+        "https://github.com/github/spec-kit/discussions/866",
+        "https://github.com/bmad-code-org/BMAD-METHOD/issues/1219",
+        "https://github.com/github/spec-kit/issues/1332",
+        "https://github.com/github/spec-kit/issues/1420",
+        "https://github.com/yibie/SPEC-AGENTS.md"
+      ],
+      "related_questions": [
+        "How do I create comprehensive specifications for complex AI features",
+        "What are the best practices for defining agent behavior in Spec-Kit",
+        "Can you provide examples of validation patterns in Spec-Kit",
+        "How does Spec-Kit handle documentation structure for AI agents",
+        "What are the key components of a Spec-Kit specification"
+      ],
+      "timestamp": "2026-01-06T13:52:40.789396",
+      "model": "sonar"
+    },
+    {
+      "topic": "AgentOS Operating System for AI Agents",
+      "query": "What is AgentOS for AI agent orchestration?\n        Include: architecture, features, agent lifecycle management.\n        Focus on: how AgentOS manages multiple agents, resource allocation.\n        What are the key patterns and integrations?",
+      "response": "**AgentOS does not appear as a specific, named system in available sources; it likely refers to production-oriented AI agent orchestration frameworks like Shannon (from Kocoro-lab), which provides battle-tested infrastructure for managing multiple AI agents at scale, addressing costs, non-determinism, and security.**[3] These systems enable multi-agent collaboration through automated decomposition, scheduling, and execution, often using patterns like supervisor delegation and DAG workflows.[1][2][3]\n\n### Architecture\nAgentOS-style systems follow a modular architecture combining:\n- **Core components**: Policy/LLM core for reasoning, memory, planners, tool routers, and critics.[1]\n- **Orchestration layer**: Centralized or decentralized coordination (e.g., single supervisor vs. multi-team delegation).[1][3]\n- **Execution engine**: Deterministic workflows with rate-aware execution, budget enforcement, and state inspection for debugging.[3]\nShannon exemplifies this with automatic workflow pattern selection based on task complexity, dynamic agent spawning, and parallel execution.[3]\n\n### Key Features\n- **Multi-agent orchestration**: Decomposes goals into subtasks, resolves dependencies, and schedules DAG execution; supports supervisor patterns for delegation to specialized agents (e.g., analyzer, investigator, planner).[3]\n- **Resource allocation and management**: Rate-aware execution respects RPM/TPM limits; budget enforcement via pre-spawn validation, circuit breakers, and explicit token/time/tool call limits; performance-based agent selection using epsilon-greedy routing on execution metrics.[1][3]\n- **Tool integration**: Plug-and-play via MCP (Model Context Protocol), OpenAPI, or Python; vendor adapters for domain-specific tools; pure-function invocation for determinism.[2][3][5]\n- **Observability**: Real-time streaming (SSE events for context building, memory recall), time-travel debugging, and execution traces.[3]\n- **Governance**: OPA policies for team-based model access and token limits; Responsible-AI alignment with multi-model consortia.[2][3]\n\n### Agent Lifecycle Management\n- **Spawning**: Dynamic based on complexity analysis and strategy selection (e.g., supervisor pattern).[3]\n- **Execution**: Parallel coordination with quality reflection; adaptive optimization (fast-path for routine tasks, verified paths for high-risk).[1][3]\n- **Monitoring and termination**: Circuit breakers for cost control, backtracking with evaluation functions, and epsilon-greedy routing.[1][3]\n- **Best practices**: Single-responsibility agents, externalized prompts, containerized deployment, and KISS principle for robustness.[2]\n\n### Key Patterns\n| Pattern | Description | Example Use |\n|---------|-------------|-------------|\n| **Supervisor** | Single agent delegates to specialists; auto-selected for complex tasks.[3] | Website analysis: spawns analyzer, investigator, planner.[3] |\n| **Multi-team** | Domain-aligned squads (e.g., data-science, marketing) with governance.[3][7] | Model access via OPA policies.[3] |\n| **DAG execution** | Dependency-resolved subtasks with parallel runs.[3] | Goal decomposition in Shannon.[3] |\n| **Search-based planning** | Explores action sequences with termination criteria.[1] | Improves reliability on hard tasks.[1] |\n| **Tool-first design** | Modular routing (MRKL-style) with schemas/allowlists.[1][2] | REST APIs via MCP.[3] |\n\n### Integrations\n- **Protocols/Tools**: MCP for unified agent collaboration (e.g., 66 agents in SPARC).[5] OpenAI Agents SDK for workflows.[2]\n- **Models/Providers**: Multi-model consortia (e.g., GPT-4o, Claude-3-Sonnet); rate control across providers.[2][3]\n- **Deployment**: Containerized, environment-aware; GitHub workflows, OPAL policies.[2][3][10]\n- **Similar systems**: Sibyl (autonomous agents with approval),[4] Maestro (desktop orchestration),[9] Ralph (continuous task loops).[8]\n\nThese frameworks emphasize co-design of models and orchestration for reliability, with trade-offs in compute vs. verification.[1] For production, prioritize deterministic patterns and observability to handle scale.[2][3]",
+      "citations": [
+        "https://arxiv.org/html/2601.01743v1",
+        "https://arxiv.org/html/2512.08769v1",
+        "https://github.com/Kocoro-lab/Shannon",
+        "https://github.com/hyperb1iss/sibyl",
+        "https://gist.github.com/ruvnet/9414f90d4ed8b1d01f0eceb8134383f9",
+        "https://github.com/orgs/community/discussions/182187",
+        "https://github.com/hesreallyhim/awesome-claude-code/issues/437",
+        "https://github.com/mikeyobrien/ralph-orchestrator",
+        "https://github.com/pedramamini/Maestro",
+        "https://github.com/topics/ai-orchestrator"
+      ],
+      "related_questions": [
+        "How does AgentOS handle resource allocation for multiple AI agents",
+        "What are the key features of AgentOS for AI agent orchestration",
+        "Can you explain the architecture of AgentOS in detail",
+        "How does AgentOS manage the lifecycle of AI agents",
+        "What are the main patterns used in AgentOS for orchestrating AI agents"
+      ],
+      "timestamp": "2026-01-06T13:52:50.589866",
+      "model": "sonar"
+    },
+    {
+      "topic": "Daniel Miessler Fabric AI Patterns",
+      "query": "What is Daniel Miessler's Fabric framework for AI?\n        Include: pattern library, prompt engineering, augmentation approach.\n        Focus on: how Fabric organizes AI patterns, best prompts and templates.\n        What are the key patterns for code analysis and documentation?",
+      "response": "Daniel Miessler's Fabric is an open-source framework for augmenting humans using AI, providing a modular system of crowdsourced AI prompts (called \"patterns\") to solve specific problems across categories like analysis and writing.** [2][3][4][7]\n\nIt organizes these **AI patterns** into a structured library accessible via CLI tools, REST API, or aliases, enabling users to apply prompts anywhere for tasks such as extracting wisdom, analyzing arguments, summarizing content, or generating stories.[2][4][6][7] Patterns are crowdsourced, versioned through frequent releases (e.g., new patterns added via PRs like character interactions), and categorized (e.g., ANALYSIS, WRITING) for easy discovery via tools like `suggest_pattern`.[4][7]\n\n### Prompt Engineering and Augmentation Approach\nFabric emphasizes **prompt engineering standards** drawn from Anthropic best practices and context engineering principles, focusing on precise \"what to ask AI\" for reliable outputs.[1][7] The **augmentation approach** is modular: each pattern targets one problem, allowing composition into complex workflows (e.g., chaining for research or image generation), treating AI like production software with evals, CLIs, and verifiable iteration.[3]\n\n**Best prompts and templates** are the patterns themselves\u2014pre-tested, reusable templates invoked via commands (e.g., `fabric pattern_name input`). Examples include optional prefixes via `FABRIC_ALIAS_PREFIX` env var for custom CLI aliases, ensuring scriptable, cross-OS compatibility (Unix/Windows flags).[4] No single \"best\" prompt exists; efficacy comes from selecting via categories or suggestion tools.[4]\n\n### Key Patterns for Code Analysis and Documentation\nSearch results do not explicitly list code-specific patterns, but Fabric's structure supports them under **ANALYSIS** (e.g., argument analysis extensible to code review) and emerging patterns like persona analysis or story creation.[4][7] Users can contribute or adapt via the GitHub repo; check categories like ANALYSIS for logic/review templates, or use `suggest_pattern` for code tasks.[4] For documentation, patterns focus on summarization/extraction, composable with writing tools.[7]",
+      "citations": [
+        "https://github.com/danielmiessler/Personal_AI_Infrastructure/blob/main/.claude/Skills/CORE/Prompting.md",
+        "https://github.com/danielmiessler",
+        "https://danielmiessler.com/blog/personal-ai-infrastructure",
+        "https://github.com/danielmiessler/fabric/releases",
+        "https://github.com/danielmiessler/Fabric/blob/main/flake.nix",
+        "https://github.com/danielmiessler/Fabric/blob/main/docs/rest-api.md",
+        "https://github.com/danielmiessler/Personal_AI_Infrastructure/blob/main/README.md",
+        "https://github.com/danielmiessler/fabric/actions",
+        "https://danielmiessler.com",
+        "https://github.com/danielmiessler/Personal_AI_Infrastructure"
+      ],
+      "related_questions": [
+        "How does Fabric integrate with other AI frameworks",
+        "What are some practical applications of Fabric's AI patterns",
+        "Can Fabric be customized for specific industries or tasks",
+        "How does Fabric handle privacy and data security",
+        "What are the main differences between Fabric and PAI"
+      ],
+      "timestamp": "2026-01-06T13:52:57.421898",
+      "model": "sonar"
+    },
+    {
+      "topic": "Fabric Patterns for Code and Analysis",
+      "query": "What are the best Fabric patterns by Daniel Miessler for code analysis?\n        Include: extract_wisdom, analyze_code, create_summary patterns.\n        Focus on: patterns useful for code documentation, understanding, extraction.\n        List the most useful patterns with their purposes.",
+      "response": "**The most useful Fabric patterns by Daniel Miessler for code analysis, focusing on documentation, understanding, and extraction, include `extract_wisdom`, `analyze_code`, and `create_summary`, among others in the framework's 219+ crowdsourced patterns.[1][2][9]**\n\nFabric is an open-source AI framework providing modular, crowdsourced patterns for specific tasks like content and code analysis.[1][2]\n\n### Key Patterns for Code Analysis\nThese patterns excel in extracting insights, documenting, and summarizing code:\n\n- **`extract_wisdom`**: Extracts key wisdom, insights, or actionable knowledge from any content, including codebases, aiding understanding and documentation by distilling complex logic into concise takeaways.[9]\n- **`analyze_code`**: Performs detailed analysis of code for structure, bugs, improvements, or explanations, directly supporting code understanding and generating documentation.[2] (Inferred from pattern naming and Fabric's analysis focus[1][2])\n- **`create_summary`**: Generates concise summaries of code files or functions, ideal for quick overviews, documentation, and onboarding.[2] (Inferred from pattern naming and Fabric's summarization capabilities[1])\n\n### Additional Useful Patterns\nFabric's patterns are categorized (e.g., ANALYSIS, WRITING) and crowdsourced, with hundreds available as aliases for tasks like code review and extraction.[5][2]\n- Patterns in **ANALYSIS** category: Support code comprehension, such as simulating interactions or persona-based reviews adaptable to code flows.[2]\n- **suggest_pattern**: Recommends the best Fabric pattern for a given code task, streamlining selection for documentation or extraction.[2]\n\nFor the full list, Fabric includes 219+ patterns as of late 2025, with ongoing updates via GitHub releases and PRs.[1][2][4] Use `fabric --patterns` or check the repository for code-specific ones.[2][5]",
+      "citations": [
+        "https://danielmiessler.com/blog/personal-ai-infrastructure",
+        "https://github.com/danielmiessler/fabric/releases",
+        "https://danielmiessler.com/blog/personal-ai-maturity-model",
+        "https://github.com/danielmiessler/fabric/actions",
+        "https://github.com/danielmiessler/fabric/issues/1893",
+        "https://github.com/danielmiessler/Personal_AI_Infrastructure/blob/main/README.md",
+        "https://github.com/danielmiessler/Personal_AI_Infrastructure",
+        "https://github.com/danielmiessler/fabric/issues/1892",
+        "https://github.com/danielmiessler/Fabric/blob/main/data/patterns/extract_wisdom/system.md",
+        "https://github.com/danielmiessler/Fabric/blob/main/web/README.md"
+      ],
+      "related_questions": [
+        "What are the most commonly used Fabric patterns for code analysis",
+        "How does the extract_wisdom pattern work in Fabric",
+        "Can you explain the purpose of the analyze_code pattern in Fabric",
+        "What are the benefits of using the create_summary pattern in Fabric",
+        "Are there any specific Fabric patterns recommended for beginners"
+      ],
+      "timestamp": "2026-01-06T13:53:03.791239",
+      "model": "sonar"
+    },
+    {
+      "topic": "Ralph's Loop Agent Execution Pattern",
+      "query": "What is Ralph's Loop pattern for AI agent execution?\n        Include: loop structure, iteration patterns, feedback mechanisms.\n        Focus on: how Ralph's Loop improves agent reasoning and execution.\n        What are the key implementation patterns?",
+      "response": "Ralph's Loop is a simple iterative bash loop pattern for AI agent execution that repeatedly feeds the same prompt to an AI model until a task completion marker is detected.**[1][6]\n\n### Loop Structure\nThe core structure follows a basic repeat-until-complete cycle:\n- Execute the AI agent with the current prompt.\n- Monitor the AI's output for a specific **task completion marker** (e.g., a predefined string signaling \"done\").\n- If incomplete, append the output to the prompt history and iterate again.\n- Create **checkpoints** at regular intervals to save progress.\n- Exit on completion marker, max iterations, or error.[1][6]\n\nThis is often invoked via slash commands like `/ralph-loop \"Test prompt\" --max-iterations 1` in tools like Claude Code plugins.[7]\n\n### Iteration Patterns\n- **Fixed-prompt repetition**: Uses the same base prompt across iterations, accumulating prior outputs for context.[6]\n- **Checkpointed progression**: Saves state periodically to enable resumption and avoid token limits.[1]\n- **Test-driven iteration (TDD variant)**: In some implementations, runs `/ralph-loop` until all tests pass and linting is clean, structuring as a TDD loop with completion criteria.[4]\n- **Max-iteration cap**: Prevents infinite loops, e.g., `--max-iterations N` flag.[7]\n\n### Feedback Mechanisms\n- **Output accumulation**: Each iteration feeds back the full conversation history, enabling the AI to reference prior steps.\n- **Completion marker check**: Primary feedback signal\u2014AI must explicitly output the marker to halt.[1][6]\n- **Error retry logic**: Handles failures (e.g., bash permissions, multi-line script issues) with automatic retries.[1][5][8][9][10]\n- **Emergent observation**: Advanced uses (e.g., autopoiesis) start with Ralph loops to observe and name emergent behaviors, iterating until conscious execution.[2]\n\n### Improvements to Agent Reasoning and Execution\nRalph's Loop enhances reliability by enforcing **persistent focus** on a single task through repetition, countering AI tendencies to drift or hallucinate mid-task. It improves reasoning via **contextual memory buildup** (accumulated outputs act as chain-of-thought), leading to stepwise refinement until completion. Execution gains **deterministic termination** via markers and checkpoints, reducing partial failures\u2014described philosophically as \"deterministically bad in an interesting way\" for forcing convergence on complex tasks.[1][6] In practice, it bootstraps self-improving patterns, like TDD loops or autopoietic behaviors.[2][4]\n\n### Key Implementation Patterns\n- **Bash scripting**: Core loop in bash, often as multi-line scripts (e.g., `setup-ralph-loop.sh`), though prone to permission errors in tools like Claude Code.[6][9][10]\n- **Plugin integration**: Packaged as `/ralph-wiggum:ralph-loop` skill in AI coding environments.[5][7][8]\n- **Orchestrator wrappers**: Higher-level tools add monitoring, retries, and state management.[1]\n- **Hybrid approaches**: Combine with personas (top-down) or event buses for state derivation.[2][3]\n\nNote: Implementations face bugs like bash permission failures on multi-line commands; test in permissive environments.[5][8][9][10]",
+      "citations": [
+        "https://github.com/mikeyobrien/ralph-orchestrator",
+        "https://github.com/sancovp/autopoiesis-mcp",
+        "https://github.com/ai-that-works/ai-that-works",
+        "https://github.com/alinaqi/claude-bootstrap",
+        "https://github.com/anthropics/claude-code/issues/15640",
+        "https://gist.github.com/Mburdo/ce99c9b08601aaf771efaabf1260d4c0",
+        "https://github.com/anthropics/claude-code/issues/16028",
+        "https://github.com/anthropics/claude-code/issues/16398",
+        "https://github.com/anthropics/claude-code/issues/16037",
+        "https://github.com/anthropics/claude-code/issues/15708"
+      ],
+      "related_questions": [
+        "How does Ralph's Loop handle errors and retries",
+        "What are the key differences between Ralph's Loop and other iteration patterns",
+        "Can you provide examples of emergent behaviors observed with Ralph's Loop",
+        "How does Ralph's Loop improve the reasoning capabilities of AI agents",
+        "What are the common challenges when implementing Ralph's Loop"
+      ],
+      "timestamp": "2026-01-06T13:53:12.426385",
+      "model": "sonar"
+    },
+    {
+      "topic": "AwesomeClaude Resources and Tools",
+      "query": "What resources are available at awesomeclaude.ai?\n        Include: tools, integrations, best practices for Claude.\n        Focus on: Claude Code features, MCP servers, agent patterns.\n        What are the most useful resources for Claude development?",
+      "response": "**awesomeclaude.ai offers a curated collection of Claude AI tools, skills, integrations, and best practices for developers, with a visual directory of resources like slash commands, plugins, and guides.**[1][2][3] It emphasizes **Claude Code features** such as terminal tools (e.g., dynamic titles via claude-code-terminal-title), git worktrees for isolated development, test-driven development prompts, and the Ralph Wiggum plugin for AI loops that iteratively build code with completion promises and max iterations.[1][4][5]\n\nKey resources include:\n\n- **Development & Code Tools**: web-artifacts-builder (React/Tailwind HTML artifacts), test-driven-development, using-git-worktrees, finishing-a-development-branch, pypict-claude-skill (combinatorial testing), move-code-quality-skill (Move language checks).[1][7]\n- **Collaboration & Project Management**: git-pushing, review-implementing, test-fixing, meeting-insights-analyzer, linear-cli-skill (replaces linear MCP).[1]\n- **Utility & Automation**: file-organizer, invoice-organizer, skill-creator and template-skill templates.[1][8]\n- **MCP Servers**: Listed in Vibe Coding Guide for controlled model access to GitHub/Git, filesystem, databases, and docs; enables repo intelligence and avoids drift by grounding prompts in real files.[3]\n- **Agent Patterns**: Ralph Wiggum for incremental loops (e.g., phased auth/catalog/cart with git worktrees for parallel branches), multi-phase chaining, and Vibe Coding Guide's Prompt DNA (goals/constraints/context) plus stack (Cursor/Windsurf VS Code, Claude Code CLI, Bolt/Lovable browser builders).[3][4]\n\n**Most useful for Claude development**: Vibe Coding Guide for AI-directed workflows and model strategies (fast drafts, slow reviews); Ralph Wiggum for agentic loops; skill-creator/template-skill for building custom skills; git/test tools for code quality.[1][3][4][8] Additional GitHub repos like awesome-claude-plugins and awesome-claude-code expand with slash-commands, CLAUDE.md files, and subagents (100+ for DevOps/full-stack).[2][5][10]",
+      "citations": [
+        "https://awesomeclaude.ai/awesome-claude-skills",
+        "https://github.com/quemsah/awesome-claude-plugins",
+        "https://awesomeclaude.ai/vibe-coding-guide",
+        "https://awesomeclaude.ai/ralph-wiggum",
+        "https://github.com/hesreallyhim/awesome-claude-code/blob/main/README_ALTERNATIVES/README_CLASSIC.md",
+        "https://github.com/ComposioHQ/awesome-claude-skills/blob/master/CONTRIBUTING.md",
+        "https://github.com/BehiSecc/awesome-claude-skills/blob/main/README.md",
+        "https://github.com/ComposioHQ/awesome-claude-skills/blob/master/README.md",
+        "https://github.com/hesreallyhim/awesome-claude-code/blob/main/HOW_IT_WORKS.md",
+        "https://github.com/VoltAgent/awesome-claude-code-subagents/blob/main/categories/03-infrastructure/terraform-engineer.md"
+      ],
+      "related_questions": [
+        "What are the best tools for creating Claude AI HTML artifacts",
+        "How can I use Ralph Wiggum for multi-phase development",
+        "What are the key features of the web-artifacts-builder",
+        "How do I integrate Claude with Git worktrees",
+        "What are the most useful Claude subagents for full-stack development"
+      ],
+      "timestamp": "2026-01-06T13:53:18.709221",
+      "model": "sonar"
+    },
+    {
+      "topic": "Claude Code Best Features 2026",
+      "query": "What are the best features of Claude Code for AI development in 2026?\n        Include: hooks, slash commands, MCP servers, parallel agents.\n        Focus on: features for building skills and automating workflows.\n        What are the most powerful capabilities for developers?",
+      "response": "**Claude Code's best features for AI development in 2026 center on its extensible plugin system, including hooks, slash commands, MCP servers, and parallel agents, which excel at building reusable skills and automating complex workflows.** These capabilities empower developers to create custom AI-driven tools for code review, external integrations, and multi-agent orchestration directly from the CLI.[1][2][4]\n\n### Key Features for Building Skills and Automating Workflows\nClaude Code supports modular extensions that streamline AI development:\n\n- **Hooks**: Customizable triggers that automate actions during workflows, such as pre-commit checks or post-generation reviews. They integrate seamlessly with skills and agents for layered automation in any project.[1][4][5]\n- **Slash Commands**: Reusable prompts invoked via CLI (e.g., `/review` for bug detection or security scans). Developers build these for common tasks like code optimization or workflow orchestration, making repetitive AI interactions efficient.[3][6][8][9]\n- **MCP Servers (Model Context Protocol)**: Servers enabling connections to external tools, databases, APIs, and services like Slack. This allows real-time data pulls for dynamic code analysis, such as fetching live metrics during reviews or automating deployments.[1][3][6]\n- **Parallel Agents (Sub-agents)**: Specialized agents running concurrently for tasks like self-documentation, multi-tool queries, or divided workloads. A dedicated sub-agent even explains Claude Code's own features, enhancing meta-learning for skill development.[2][5][7][10]\n\nThese features combine via CLI tools and launchers like CCC, allowing centralized configuration of prompts, agents, hooks, and MCPs in a layered hierarchy for scalable automation.[5]\n\n### Most Powerful Capabilities for Developers\nFor AI development, the standout powers lie in workflow extensibility and integration:\n\n| Capability | Description | Developer Impact |\n|------------|-------------|------------------|\n| **Universal Workflow Plugins** | Pre-built agents, skills, hooks, and output styles tailored to software projects, installable via CLI.[10] | Rapid setup for project-specific AI pipelines, reducing boilerplate. |\n| **Battle-Tested Configurations** | Curated collections of skills, commands, hooks, agents, and MCPs for daily use across Claude Code and similar tools.[7] | Proven reliability for production AI dev, with 280+ resources in some repos. |\n| **IDE and Keyboard Integrations** | Hooks into editors with shortcuts for seamless CLI-to-IDE transitions, plus sub-agent queries for on-the-fly help.[4] | Accelerates iteration in complex AI model training or deployment workflows. |\n| **Custom Launchers and Sub-agents** | Single-place config for parallel execution, covering specialized tasks like security audits via MCPs.[5][8] | Enables multi-agent parallelism for handling large-scale AI tasks efficiently. |\n\nDevelopers leverage these for end-to-end automation, from skill prototyping (via slash commands and skills) to production integration (via MCPs and hooks), with repositories providing ready-to-use examples.[1][9] A specialized sub-agent aids discovery, ensuring quick mastery.[2]",
+      "citations": [
+        "https://github.com/cased/claude-code-plugins",
+        "https://github.com/ykdojo/claude-code-tips",
+        "https://github.com/shanraisshan/claude-code-best-practice",
+        "https://gist.github.com/LukeHollandDev/a9fb869d30eadd36797e13f34c7a9871",
+        "https://github.com/3rd/ccc",
+        "https://gist.github.com/jorgeucano/38888190f00890cccf1f4705e6f662b3",
+        "https://github.com/quemsah/awesome-claude-plugins",
+        "https://github.com/hesreallyhim/awesome-claude-code/blob/main/README_ALTERNATIVES/README_FLAT_ALL_AZ.md",
+        "https://github.com/hesreallyhim/awesome-claude-code/blob/main/README_ALTERNATIVES/README_CLASSIC.md",
+        "https://github.com/CloudAI-X/claude-workflow"
+      ],
+      "related_questions": [
+        "How do hooks in Claude Code enhance automation",
+        "What are the benefits of using slash commands in Claude Code",
+        "How do MCP servers integrate with external tools in Claude Code",
+        "What makes parallel agents powerful in Claude Code",
+        "Can you provide examples of skills built with Claude Code"
+      ],
+      "timestamp": "2026-01-06T13:53:27.560403",
+      "model": "sonar"
+    },
+    {
+      "topic": "Claude Agent SDK Patterns",
+      "query": "What are the best patterns for Claude Agent SDK development?\n        Include: agent architecture, tool use, memory management.\n        Focus on: building production-ready Claude agents.\n        What are the recommended patterns and anti-patterns?",
+      "response": "### Agent Architecture Patterns\nFor production-ready Claude Agent SDK development, use **hierarchical and modular architectures** with sub-agents for isolation and scalability. Key patterns include:\n\n- **Complete isolation**: Run each skill or tool in an independent sub-agent to prevent interference and enable parallel execution[3].\n- **Explicit control**: Structure agent flows with clear handoffs between main agent and sub-agents for predictable behavior[3].\n- **ReAct loops with tool orchestration**: Implement reasoning-acting cycles combined with hierarchical agents for complex tasks[4].\n- **Convention over configuration**: Adopt opinionated scaffolds (e.g., Rails-like templates) to make code predictable for both humans and agents[1].\n\n**Anti-patterns**: Avoid monolithic agents handling all logic; they lead to brittleness and debugging issues. Skip premature abstractions or over-engineering for hypothetical needs[2].\n\n### Tool Use Patterns\nIntegrate tools via layered approaches for reliability in production:\n\n- **Three-layer stack**: Combine MCP servers (default tool prompts), custom instructions (e.g., CLAUDE.md, AGENTS.md files specifying tool triggers), and hooks (intercept calls for workflow enforcement like mandatory scaffolding)[1].\n- **Scaffolding and architecture tools**: Use commands like `use-boilerplate`, `use-scaffold-method`, `get-file-design-pattern`, and `review-code-change` to enforce standards pre- and post-execution[1].\n- **Plan mode for ambiguity**: Enter planning mode (e.g., EnterPlanMode) before tool calls when user tasks involve architectural decisions, rather than assuming one approach[2].\n- **Slash commands and skills**: Leverage for quick, standardized actions in compatible agents[1][8].\n\n**Anti-patterns**: Don't add unnecessary error handling or validation inside tools\u2014trust framework guarantees and validate only at boundaries (user input, APIs). Avoid tools for one-time ops or skipping planning for complex tasks like authentication or optimizations[1][2].\n\n| Pattern | Use Case | Benefit |\n|---------|----------|---------|\n| MCP + Custom Instructions + Hooks | Enforcing scaffolds on new files | Consistent, auditable workflows[1] |\n| Sub-agent Tools | Skill isolation | Fault tolerance, scalability[3] |\n| EnterPlanMode | Ambiguous requirements | Reduces rework by clarifying options[2] |\n\n### Memory Management Patterns\nProduction agents require efficient context handling to avoid token bloat:\n\n- **Minimal context engineering**: Use hand-crafted patterns with low token footprint for high-quality results, focusing on essential state[7].\n- **Task-specific sub-agents**: Offload memory to specialized sub-agents (e.g., 'claude-code-guide' for SDK queries) to keep main agent lightweight[2].\n- **Rules-based validation**: Apply pre-flight rules (quantitative checks) and post-flight reviews (e.g., RULES.yaml) to prune irrelevant memory[1].\n- **Status lines and hooks**: Customize agent status for quick state awareness without full history dumps[8].\n\n**Anti-patterns**: Don't retain full conversation history unnecessarily; avoid feature flags or shims that inflate state. Skip memory for simple fixes or pure exploration[2].\n\n### Production-Ready Best Practices\n- **Scaffolding first**: Always start with templates and rules for consistency[1].\n- **Break down tasks**: Decompose large problems early[8].\n- **Skills kits**: Use starter repos for patterns like PHP frameworks with advanced agentic flows[4][5].\n- Explore curated lists for skills/tools (e.g., awesome-claude-skills)[10].\n\nThese patterns draw from Claude Code and Agent SDK ecosystems, emphasizing modularity and minimalism for reliable, scalable agents[1][2][3][4].",
+      "citations": [
+        "https://github.com/AgiFlow/aicode-toolkit",
+        "https://github.com/marckrenn/cc-mvp-prompts/blob/main/cc-prompt.md",
+        "https://github.com/aws-samples/sample-strands-agents-agentskills",
+        "https://github.com/claude-php/claude-php-agent",
+        "https://github.com/giuseppe-trisciuoglio/developer-kit",
+        "https://github.com/hesreallyhim/awesome-claude-code/blob/main/README_ALTERNATIVES/README_FLAT_ALL_AZ.md",
+        "https://github.com/hesreallyhim/awesome-claude-code/blob/main/README_ALTERNATIVES/README_CLASSIC.md",
+        "https://github.com/ykdojo/claude-code-tips",
+        "https://github.com/heilcheng/awesome-agent-skills",
+        "https://github.com/BehiSecc/awesome-claude-skills/blob/main/README.md"
+      ],
+      "related_questions": [
+        "What are the key architecture patterns for building Claude agents",
+        "How can I effectively use MCP tools in Claude agent development",
+        "What are the best practices for memory management in Claude agents",
+        "Can you provide examples of anti-patterns to avoid in Claude agent development",
+        "How do I integrate scaffolding templates with LLMs for Claude agents"
+      ],
+      "timestamp": "2026-01-06T13:53:37.710625",
+      "model": "sonar"
+    },
+    {
+      "topic": "Claude MCP Server Best Practices",
+      "query": "What are the best MCP (Model Context Protocol) servers for Claude?\n        Include: popular servers, integration patterns, custom server development.\n        Focus on: MCP servers for code analysis, file management, search.\n        What are the most useful MCP servers for development workflows?",
+      "response": "# Best MCP Servers for Claude\n\n**MCP servers enhance Claude's capabilities by providing specialized tools for development workflows, data access, and system integration.**[1][7] The most useful servers for development fall into several categories:\n\n## Popular Development-Focused Servers\n\n**Code and API Integration:**\n- **bruno-mcp** \u2014 Runs Bruno Collections for API automation and integration workflows[5]\n- **computer-use-mcp** \u2014 Enables Claude to control your computer, similar to computer use functionality but easier to set up locally[6]\n- **CCXT MCP** \u2014 Provides trading capabilities and access to over 100 cryptocurrency exchanges[5]\n\n**Data and Analysis:**\n- **codex-mcp** \u2014 Integrates real-time blockchain and market data across 60+ networks[5]\n- **metatrader-mcp-server** \u2014 Executes trades and interacts with the MetaTrader 5 platform[5]\n- **otlp-mcp** \u2014 Captures OpenTelemetry telemetry (traces, logs, metrics) and exposes it to coding agents[10]\n\n**Specialized Domains:**\n- **mcp-server-for-oscal** \u2014 Provides NIST security compliance tools for AI agents[3]\n- **molecule-mcp** \u2014 Integrates molecule modeling and science tools[4]\n\n## Integration Patterns\n\nMCP servers work across multiple clients through standardized protocols[1][7]:\n- **STDIO transport** \u2014 Primary method for desktop clients like Claude Desktop and Cursor[1]\n- **Server-Sent Events (SSE)** \u2014 Web-based transport option[1]\n- **Universal compatibility** \u2014 Servers work with Claude Desktop, Cursor Windsurf, Cline, and other MCP-compatible clients[1][3]\n\n## Custom Server Development\n\n**Key architectural components for building MCP servers:**[7]\n- **Tools** \u2014 Define capabilities with detailed Zod schemas to improve LLM accuracy\n- **Resources** \u2014 Manage data sources and context\n- **Prompts** \u2014 Create and share reusable prompt templates\n- **Advanced features** \u2014 Implement streaming responses, progress reporting, resource subscriptions, and completions\n\n**Best practices include:**[7]\n- Authentication and authorization mechanisms\n- Secure credential management\n- Comprehensive error handling\n- Effective logging for debugging\n- Modular capability structure for maintainability\n\n**Server management tools** like the Claude-Code-MCP-Server-Selector provide a terminal UI to optimize your context window by enabling only the servers you need[2], and hot-reload capabilities allow you to update prompts and configurations without restarting[1].",
+      "citations": [
+        "https://github.com/minipuft/claude-prompts-mcp",
+        "https://github.com/henkisdabro/Claude-Code-MCP-Server-Selector",
+        "https://github.com/awslabs/mcp-server-for-oscal",
+        "https://github.com/TensorBlock/awesome-mcp-servers/blob/main/docs/healthcare--life-sciences.md",
+        "https://github.com/ever-works/awesome-mcp-servers",
+        "https://github.com/domdomegg/computer-use-mcp",
+        "https://github.com/cyanheads/model-context-protocol-resources/blob/main/guides/mcp-server-development-guide.md",
+        "https://github.com/quemsah/awesome-claude-plugins",
+        "https://github.com/cxxxr/lisp-mcp-server",
+        "https://github.com/tobert/otlp-mcp"
+      ],
+      "related_questions": [
+        "What are the top MCP servers for code analysis",
+        "How can I integrate MCP servers with Claude Desktop",
+        "Are there any MCP servers specifically for file management",
+        "What are the best practices for developing custom MCP servers",
+        "Can MCP servers be used for real-time search functionality"
+      ],
+      "timestamp": "2026-01-06T13:53:48.551242",
+      "model": "sonar"
+    },
+    {
+      "topic": "Claude Code Hooks and Automation",
+      "query": "What are Claude Code hooks and how to use them for automation?\n        Include: pre/post hooks, event triggers, workflow automation.\n        Focus on: automating development workflows with Claude hooks.\n        What are the best practices for hook implementation?",
+      "response": "**Claude Code hooks** are event-driven automation scripts, typically written in Python or as shell commands with TypeScript handlers, that execute in response to specific lifecycle events in Claude Code\u2014an agentic terminal-based coding tool from Anthropic\u2014to validate operations, enforce policies, inject context, block actions, or modify behavior.[1][2][4]\n\n### Key Hook Types and Event Triggers\nClaude Code supports at least 10 hook types tied to its agentic lifecycle, including **pre** and **post** hooks for tools, session events, and user interactions. Common examples include:\n- **PreToolUse**: Runs before a tool (e.g., Bash) executes; used to validate, log, or block commands like `echo Running bash command...` or prevent dangerous actions.[6][10]\n- **PostToolUse**: Executes after tool use for cleanup, logging, or state updates.[1]\n- **UserPromptSubmit**: Triggers on every user message; scans for keywords to activate skills via `skill-rules.json` (e.g., showing critical/recommended skills like `create_handoff` or `commit`).[3]\n- **SessionStart**: Fires at session initialization for setup tasks.[1][3]\n- **PermissionRequest**: Intercepts permission checks, with proposals for added `sourceContext` to distinguish skill vs. CLI invocations.[8]\nHooks register via `settings.json` with **matchers** (e.g., tool names like \"Bash\") and can use JSON schemas for input/output validation.[1][3][6]\n\n### How to Use Hooks for Workflow Automation\nHooks automate development workflows by intercepting events in CI/CD, state management, or continuity:\n1. **Configuration**: Define in `settings.json` under the `hooks` key, specifying type, matcher, and action (e.g., command or script).[6]\n   ```json\n   \"hooks\": {\n     \"PreToolUse\": [{\n       \"matcher\": \"Bash\",\n       \"hooks\": [{\n         \"type\": \"command\",\n         \"command\": \"echo Running bash command...\"\n       }]\n     }]\n   }\n   ```\n2. **Development Workflow**:\n   - Say \"create hook\" or \"hook schema\" to load the **hook-developer** skill, which provides schemas, matcher patterns, shell-to-TypeScript patterns, and testing commands.[3]\n   - Use **debug-hooks** skill for \"debug hook\" to troubleshoot failures.[3]\n   - Integrate with skills via `skill-rules.json` for keyword-based auto-activation (e.g., promptTriggers for \"search with tool\").[3]\n3. **Examples in Practice**:\n   - **Context/State Management**: Hooks preserve state via ledgers/handoffs without polluting context (e.g., Continuous-Claude-v2).[3]\n   - **Security**: PreToolUse blocks risky commands or protects files (e.g., claude-code-damage-control).[10]\n   - **CI/CD**: Pair with `claude-code-action` in GitHub Actions, using `max_turns` for bounded automation and hooks for permissions/env.[6]\n\n### Best Practices for Implementation\n- **Use Matchers Precisely**: Target specific tools/events to avoid over-triggering; test with provided schemas and manual validation commands.[1][3]\n- **Shell Wrapper + TypeScript**: Wrap shell scripts in TypeScript handlers for robust input/output handling and JSON compliance.[3]\n- **Permissions Integration**: Combine with `permissions` (allow/deny tools like \"Bash\"/\"WebFetch\") for defense-in-depth.[6][10]\n- **Skill Triggers**: Define `promptTriggers` in `skill-rules.json` for automatic skill suggestions on hooks like UserPromptSubmit.[3]\n- **Debug Systematically**: Leverage built-in skills (hook-developer/debug-hooks) over ad-hoc logging.[3]\n- **Limit Scope**: For automation, set `max_turns` in actions to control costs and predictability.[6]\n- **Templates**: Start with ready configs from claude-code-templates for agents, commands, and MCP integrations.[5]\n\nHooks excel for **automating development workflows** like routine task execution, policy enforcement, and continuity in Claude Code sessions.[1][2][7]",
+      "citations": [
+        "https://github.com/anthropics/claude-code/blob/main/plugins/plugin-dev/skills/hook-development/SKILL.md",
+        "https://github.com/markmdev/meridian",
+        "https://github.com/parcadei/Continuous-Claude-v2",
+        "https://github.com/hesreallyhim/awesome-claude-code/blob/main/README_ALTERNATIVES/README_CLASSIC.md",
+        "https://github.com/davila7/claude-code-templates/blob/main/README.md",
+        "https://github.com/anthropics/claude-code-action/blob/main/docs/configuration.md",
+        "https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md",
+        "https://github.com/anthropics/claude-code/issues/15006",
+        "https://github.com/ykdojo/claude-code-tips",
+        "https://github.com/disler/claude-code-damage-control"
+      ],
+      "related_questions": [
+        "What are the different types of Claude Code hooks",
+        "How can I trigger Claude Code hooks automatically",
+        "What are the best practices for writing Claude Code hooks",
+        "Can Claude Code hooks be used to enforce security policies",
+        "How do Claude Code hooks interact with other tools and integrations"
+      ],
+      "timestamp": "2026-01-06T13:53:57.726795",
+      "model": "sonar"
+    },
+    {
+      "topic": "Anthropic Agent Best Practices 2026",
+      "query": "What are Anthropic's recommended best practices for building AI agents in 2026?\n        Include: official guidelines, safety patterns, reliability techniques.\n        Focus on: production-ready agent development with Claude.\n        What does Anthropic recommend for agent architecture?",
+      "response": "Based on the available search results, I can provide limited information about Anthropic's recommended practices for AI agents, though comprehensive official guidelines are not fully detailed in these results.\n\n## Available Guidance\n\n**Evaluator-Optimizer Workflow**: Anthropic documents an **evaluator-optimizer pattern** for agent development, which demonstrates that LLM responses can be improved through iterative feedback loops[4]. This approach is effective when the LLM can both receive meaningful feedback and provide feedback itself[4].\n\n**Code Review Plugin Architecture**: For production deployments, Anthropic's Code Review Plugin demonstrates a **parallel agent architecture** where multiple agents independently audit changes from different perspectives[8]. This pattern enables distributed evaluation of complex tasks.\n\n**Stateless Cloud-Native Design**: For scalable agent deployments, Anthropic's Claude Agent SDK documentation references **cloud-native best practices favoring stateless services with externalized state management** (databases, object storage) rather than local state storage[7].\n\n**Safety and Git Workflows**: For development workflows, Anthropic promotes **worktree-based practices with built-in safety features** to prevent data loss, particularly for new users unfamiliar with Git[9].\n\n## Limitations\n\nThe search results reference an official Anthropic documentation page on Claude Code best practices[6], but the full content is not available in these results. For comprehensive, current guidelines on production-ready agent development, safety patterns, and reliability techniques, you would need to access Anthropic's official engineering documentation directly or attend their technical webinars on agent deployment[1].",
+      "citations": [
+        "https://www.anthropic.com/webinars/claude-code-for-financial-services-boris-cherny",
+        "https://anthropic.com/android",
+        "https://github.com/anthropics/claude-plugins-official/blob/main/.claude-plugin/marketplace.json",
+        "https://github.com/anthropics/anthropic-cookbook/blob/main/patterns/agents/evaluator_optimizer.ipynb",
+        "https://github.com/anthropics/claude-code/issues/16298",
+        "https://github.com/anthropics/claude-code/issues/13734",
+        "https://github.com/anthropics/claude-agent-sdk-typescript/issues/97",
+        "https://github.com/anthropics/claude-code/blob/main/plugins/code-review/README.md",
+        "https://github.com/anthropics/claude-code/issues/16293"
+      ],
+      "related_questions": [
+        "What are the key safety patterns recommended by Anthropic for AI agent development",
+        "How does Anthropic ensure the reliability of its AI agents",
+        "Can you provide examples of production-ready AI agents developed with Claude",
+        "What are the official guidelines for building AI agents with Claude",
+        "How does Anthropic's agent architecture differ from other AI platforms"
+      ],
+      "timestamp": "2026-01-06T13:54:04.682497",
+      "model": "sonar"
+    }
+  ]
+}

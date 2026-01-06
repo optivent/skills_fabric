@@ -258,10 +258,13 @@ class LSPClient:
         return [parse_symbol(item) for item in result]
     
     def _send_request(self, method: str, params: Optional[dict]) -> Optional[dict]:
-        """Send LSP request and get response."""
+        """Send LSP request and get response.
+
+        Implements proper LSP JSON-RPC protocol with header parsing.
+        """
         if not self._process:
             return None
-        
+
         self._request_id += 1
         message = {
             "jsonrpc": "2.0",
@@ -269,18 +272,63 @@ class LSPClient:
             "method": method,
             "params": params or {}
         }
-        
+
         try:
             content = json.dumps(message)
             header = f"Content-Length: {len(content)}\r\n\r\n"
             self._process.stdin.write((header + content).encode())
             self._process.stdin.flush()
-            
-            # Read response (simplified - real impl needs header parsing)
-            # This is a stub - full implementation needs proper protocol handling
-            return {}
+
+            # Read response with proper LSP protocol header parsing
+            response = self._read_response()
+            if response and response.get("id") == self._request_id:
+                if "error" in response:
+                    print(f"[LSP] Error: {response['error']}")
+                    return None
+                return response.get("result")
+            return None
         except Exception as e:
             print(f"[LSP] Request error: {e}")
+            return None
+
+    def _read_response(self, timeout: float = 10.0) -> Optional[dict]:
+        """Read and parse LSP response with header parsing.
+
+        LSP uses Content-Length headers followed by JSON body.
+        Format: Content-Length: <length>\r\n\r\n<json body>
+        """
+        import select
+
+        if not self._process or not self._process.stdout:
+            return None
+
+        try:
+            # Wait for data with timeout
+            ready, _, _ = select.select([self._process.stdout], [], [], timeout)
+            if not ready:
+                print("[LSP] Response timeout")
+                return None
+
+            # Read headers until we find Content-Length
+            headers = {}
+            while True:
+                line = self._process.stdout.readline().decode('utf-8')
+                if line == '\r\n' or line == '\n':
+                    break  # End of headers
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    headers[key.strip().lower()] = value.strip()
+
+            # Get content length
+            content_length = int(headers.get('content-length', 0))
+            if content_length == 0:
+                return None
+
+            # Read the JSON body
+            body = self._process.stdout.read(content_length).decode('utf-8')
+            return json.loads(body)
+        except Exception as e:
+            print(f"[LSP] Read error: {e}")
             return None
     
     def _send_notification(self, method: str, params: Optional[dict]):

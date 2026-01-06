@@ -27,29 +27,45 @@ class KuzuSkillStore:
         self.db = db
     
     def create_skill(self, skill: SkillRecord) -> str:
-        """Create a new skill in the database."""
-        safe_q = skill.question.replace("'", "''")
-        safe_code = skill.code.replace("'", "''").replace("\\", "\\\\")
-        
-        self.db.execute(f"""
-            CREATE (s:Skill {{
-                id: '{skill.id}',
-                question: '{safe_q}',
-                code: '{safe_code[:2000]}',
-                source_url: '{skill.source_url}',
-                library: '{skill.library}',
-                verified: {str(skill.verified).lower()}
-            }})
-        """)
-        
+        """Create a new skill in the database.
+
+        Uses parameterized queries to prevent Cypher injection.
+        """
+        self.db.execute(
+            """
+            CREATE (s:Skill {
+                id: $id,
+                question: $question,
+                code: $code,
+                source_url: $source_url,
+                library: $library,
+                verified: $verified
+            })
+            """,
+            {
+                "id": skill.id,
+                "question": skill.question,
+                "code": skill.code[:2000],
+                "source_url": skill.source_url,
+                "library": skill.library,
+                "verified": skill.verified
+            }
+        )
+
         return skill.id
     
     def get_skill(self, skill_id: str) -> Optional[SkillRecord]:
-        """Retrieve a skill by ID."""
-        res = self.db.execute(f"""
-            MATCH (s:Skill {{id: '{skill_id}'}})
+        """Retrieve a skill by ID.
+
+        Uses parameterized queries to prevent Cypher injection.
+        """
+        res = self.db.execute(
+            """
+            MATCH (s:Skill {id: $skill_id})
             RETURN s.question, s.code, s.source_url, s.library, s.verified
-        """)
+            """,
+            {"skill_id": skill_id}
+        )
         
         if res.has_next():
             row = res.get_next()
@@ -64,23 +80,35 @@ class KuzuSkillStore:
         return None
     
     def link_teaches(self, skill_id: str, concept_name: str) -> bool:
-        """Create TEACHES relationship."""
+        """Create TEACHES relationship.
+
+        Uses parameterized queries to prevent Cypher injection.
+        """
         try:
-            self.db.execute(f"""
-                MATCH (sk:Skill {{id: '{skill_id}'}}), (c:Concept {{name: '{concept_name}'}})
+            self.db.execute(
+                """
+                MATCH (sk:Skill {id: $skill_id}), (c:Concept {name: $concept_name})
                 CREATE (sk)-[:TEACHES]->(c)
-            """)
+                """,
+                {"skill_id": skill_id, "concept_name": concept_name}
+            )
             return True
         except Exception:
             return False
     
     def link_uses(self, skill_id: str, symbol_name: str) -> bool:
-        """Create USES relationship."""
+        """Create USES relationship.
+
+        Uses parameterized queries to prevent Cypher injection.
+        """
         try:
-            self.db.execute(f"""
-                MATCH (sk:Skill {{id: '{skill_id}'}}), (s:Symbol {{name: '{symbol_name}'}})
+            self.db.execute(
+                """
+                MATCH (sk:Skill {id: $skill_id}), (s:Symbol {name: $symbol_name})
                 CREATE (sk)-[:USES]->(s)
-            """)
+                """,
+                {"skill_id": skill_id, "symbol_name": symbol_name}
+            )
             return True
         except Exception:
             return False
@@ -90,12 +118,18 @@ class KuzuSkillStore:
         return self.db.count("Skill")
     
     def list_skills(self, limit: int = 50) -> list[SkillRecord]:
-        """List recent skills."""
-        res = self.db.execute(f"""
+        """List recent skills.
+
+        Uses parameterized queries to prevent Cypher injection.
+        """
+        res = self.db.execute(
+            """
             MATCH (s:Skill)
             RETURN s.id, s.question, s.code, s.source_url, s.library, s.verified
-            LIMIT {limit}
-        """)
+            LIMIT $limit
+            """,
+            {"limit": limit}
+        )
         
         skills = []
         while res.has_next():

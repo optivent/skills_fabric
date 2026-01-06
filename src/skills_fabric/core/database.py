@@ -1,29 +1,46 @@
-"""KuzuDB connection and schema management."""
+"""KuzuDB connection and schema management.
+
+Thread-safe database access using thread-local connections.
+"""
 import kuzu
+import threading
 from pathlib import Path
 from typing import Optional
 
 
 class KuzuDatabase:
-    """KuzuDB wrapper for Skills Fabric."""
-    
+    """Thread-safe KuzuDB wrapper for Skills Fabric.
+
+    Uses thread-local storage to ensure each thread gets its own connection,
+    preventing race conditions and connection corruption.
+    """
+
     def __init__(self, db_path: Optional[Path] = None):
         from .config import config
         self.db_path = db_path or config.kuzu_db_path
         self._db: Optional[kuzu.Database] = None
-        self._conn: Optional[kuzu.Connection] = None
-    
+        self._db_lock = threading.Lock()
+        self._local = threading.local()
+
     @property
     def db(self) -> kuzu.Database:
+        """Get or create the database instance (thread-safe singleton)."""
         if self._db is None:
-            self._db = kuzu.Database(str(self.db_path))
+            with self._db_lock:
+                # Double-check locking pattern
+                if self._db is None:
+                    self._db = kuzu.Database(str(self.db_path))
         return self._db
-    
+
     @property
     def conn(self) -> kuzu.Connection:
-        if self._conn is None:
-            self._conn = kuzu.Connection(self.db)
-        return self._conn
+        """Get thread-local connection.
+
+        Each thread gets its own connection to prevent race conditions.
+        """
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = kuzu.Connection(self.db)
+        return self._local.conn
     
     def init_schema(self) -> None:
         """Initialize the database schema."""
@@ -81,11 +98,24 @@ class KuzuDatabase:
         """Execute a Cypher query."""
         return self.conn.execute(query, params or {})
     
+    # Valid table names (whitelist for security)
+    VALID_TABLES = frozenset(["Concept", "Symbol", "Skill", "TestResult"])
+
     def count(self, table: str) -> int:
-        """Count nodes in a table."""
+        """Count nodes in a table.
+
+        Validates table name against whitelist to prevent injection.
+        """
+        if table not in self.VALID_TABLES:
+            raise ValueError(f"Invalid table name: {table}. Must be one of: {self.VALID_TABLES}")
         res = self.conn.execute(f"MATCH (n:{table}) RETURN count(n)")
         return res.get_next()[0]
 
+    def close(self) -> None:
+        """Close thread-local connection."""
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            self._local.conn = None
 
-# Global database instance
+
+# Global database instance (thread-safe)
 db = KuzuDatabase()

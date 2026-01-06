@@ -30,13 +30,17 @@ class BubblewrapSandbox:
             return False
     
     def execute_python(self, code: str, timeout: int = 10) -> ExecutionResult:
-        """Execute Python code in a sandbox."""
+        """Execute Python code in a sandbox.
+
+        Uses try/finally to ensure temp file cleanup even on exceptions.
+        """
+        code_file = None
         try:
             # Write code to temp file
             with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
                 f.write(code)
                 code_file = f.name
-            
+
             # Execute in sandbox
             cmd = [
                 "bwrap",
@@ -44,20 +48,18 @@ class BubblewrapSandbox:
                 "--dev", "/dev",
                 "--proc", "/proc",
                 "--unshare-net",  # No network
+                "--die-with-parent",  # Kill sandbox if parent dies
                 "--",
                 "python3", code_file
             ]
-            
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout
             )
-            
-            # Cleanup
-            Path(code_file).unlink()
-            
+
             return ExecutionResult(
                 success=result.returncode == 0,
                 stdout=result.stdout,
@@ -78,6 +80,13 @@ class BubblewrapSandbox:
                 stderr=str(e),
                 exit_code=-1
             )
+        finally:
+            # Always cleanup temp file, even on exception
+            if code_file:
+                try:
+                    Path(code_file).unlink(missing_ok=True)
+                except Exception:
+                    pass  # Best effort cleanup
     
     def verify_skill(self, skill_code: str) -> bool:
         """Verify a skill's code can execute."""
