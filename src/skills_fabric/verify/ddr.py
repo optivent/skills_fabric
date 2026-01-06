@@ -296,15 +296,17 @@ class DirectDependencyRetriever:
 
         Priority order:
         1. Exact matches (highest priority for zero-hallucination)
-        2. Partial matches (query in symbol name)
+        2. Partial matches (query or query words in symbol name)
         3. Word matches (query words in symbol)
+        4. Individual word searches (for multi-word queries)
         """
         exact_matches = []
         partial_matches = []
         word_matches = []
+        individual_word_matches = []
 
         query_lower = query.lower()
-        query_parts = set(query_lower.split())
+        query_parts = [p for p in query_lower.split() if len(p) > 2]  # Skip tiny words
 
         for symbol_name, entries in self._symbol_index.items():
             # Exact match (highest priority)
@@ -312,14 +314,26 @@ class DirectDependencyRetriever:
                 exact_matches.extend(entries)
                 continue
 
-            # Partial match (query contained in symbol)
+            # Partial match (full query contained in symbol)
             if query_lower in symbol_name:
                 partial_matches.extend(entries)
                 continue
 
+            # For multi-word queries: check if ANY query word is in symbol name
+            matched_by_word = False
+            for query_word in query_parts:
+                if query_word in symbol_name:
+                    partial_matches.extend(entries)
+                    matched_by_word = True
+                    break
+
+            if matched_by_word:
+                continue
+
             # Word match (e.g., "state graph" matches "StateGraph")
             symbol_words = set(re.findall(r'[a-z]+', symbol_name))
-            if query_parts & symbol_words:
+            query_word_set = set(query_parts)
+            if query_word_set & symbol_words:
                 word_matches.extend(entries)
 
         # Return in priority order: exact first, then partial, then word
