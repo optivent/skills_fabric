@@ -2,15 +2,20 @@
 """
 Unified API Manager for Skills Fabric
 
-Connects all optimal tools into a single interface:
+Updated January 2026 with latest research:
 - Anthropic (Claude Hierarchy: Opus/Sonnet/Haiku)
 - Mem0 (Memory with 90% token savings)
-- Voyage AI (Code embeddings)
-- Jina (Reranking)
-- Qdrant (Vector store)
-- Perplexity (Research)
-- E2B (Code execution)
-- LangSmith (Observability)
+- Voyage AI (Code embeddings - 13-16% better for code)
+- Zerank 2 (Reranking - #1 on leaderboard, ELO 1644)
+- Qdrant (Vector store - Rust-based, fast)
+- Perplexity (Research - F-score 0.858)
+- E2B (Code execution - secure sandboxes)
+- Agent Memory (Beads + MIRIX + ADK patterns)
+
+Key 2026 Updates:
+- Zerank 2 replaces Jina as primary reranker (ELO 1644 vs 1306)
+- Rerankers deliver 15-40% accuracy boost, 72% cost reduction
+- Agent Memory System for work orchestration and learning
 
 Usage:
     api = UnifiedAPI()
@@ -18,14 +23,14 @@ Usage:
     # Memory-aware chat
     response = await api.chat("How do I use StateGraph?", user_id="dev1")
 
-    # Code search with reranking
+    # Code search with reranking (now uses Zerank 2)
     results = await api.search_code("state machine implementation", top_k=10)
 
     # Execute code safely
     output = await api.execute_code("print('hello')")
 
     # Deep research
-    answer = await api.research("Latest LangGraph patterns 2025")
+    answer = await api.research("Latest LangGraph patterns 2026")
 """
 
 import os
@@ -54,7 +59,8 @@ class APIConfig:
 
     # Embeddings & Search
     voyage_key: str = ""
-    jina_key: str = ""
+    zerank_key: str = ""  # 2026: Zerank 2 is #1 reranker (ELO 1644)
+    jina_key: str = ""    # Fallback reranker
     qdrant_key: str = ""
     qdrant_url: str = "https://localhost:6333"
 
@@ -78,7 +84,8 @@ class APIConfig:
             mem0_key=os.getenv("MEM0_API_KEY", ""),
             zep_key=os.getenv("ZEP_API_KEY", ""),
             voyage_key=os.getenv("VOYAGE_API_KEY", ""),
-            jina_key=os.getenv("JINA_API_KEY", ""),
+            zerank_key=os.getenv("ZERANK_API_KEY", ""),  # 2026: Primary reranker
+            jina_key=os.getenv("JINA_API_KEY", ""),      # Fallback reranker
             qdrant_key=os.getenv("QDRANT_API_KEY", ""),
             qdrant_url=os.getenv("QDRANT_URL", "https://localhost:6333"),
             perplexity_key=os.getenv("PERPLEXITY_API_KEY", ""),
@@ -162,7 +169,8 @@ class UnifiedAPI:
             "mem0": await self._init_mem0(),
             "voyage": await self._init_voyage(),
             "qdrant": await self._init_qdrant(),
-            "jina": bool(self.config.jina_key),
+            "zerank": bool(self.config.zerank_key),  # 2026: Primary reranker
+            "jina": bool(self.config.jina_key),      # Fallback reranker
             "perplexity": bool(self.config.perplexity_key),
             "e2b": await self._init_e2b(),
             "langsmith": bool(self.config.langsmith_key),
@@ -577,9 +585,12 @@ class UnifiedAPI:
                 for r in results
             ]
 
-            # Rerank with Jina
-            if rerank and self.status.get("jina"):
-                search_results = await self._rerank_jina(query, search_results, top_k)
+            # Rerank with Zerank 2 (primary) or Jina (fallback)
+            if rerank:
+                if self.status.get("zerank"):
+                    search_results = await self._rerank_zerank(query, search_results, top_k)
+                elif self.status.get("jina"):
+                    search_results = await self._rerank_jina(query, search_results, top_k)
 
             return search_results[:top_k]
 
@@ -587,13 +598,67 @@ class UnifiedAPI:
             logger.error(f"Search error: {e}")
             return []
 
+    async def _rerank_zerank(
+        self,
+        query: str,
+        results: List[SearchResult],
+        top_k: int
+    ) -> List[SearchResult]:
+        """
+        Rerank results using Zerank 2.
+
+        2026 Update: Zerank 2 is #1 on Agentset leaderboard
+        - ELO Score: 1644 (highest)
+        - Latency: 265ms
+        - Cost: $0.025/M tokens
+        - 72% cost reduction in LLM pipelines
+        """
+        if not self.config.zerank_key:
+            return results
+
+        try:
+            import httpx
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.zeroentropy.dev/v1/rerank",
+                    headers={"Authorization": f"Bearer {self.config.zerank_key}"},
+                    json={
+                        "model": "zerank-2",
+                        "query": query,
+                        "documents": [r.content for r in results],
+                        "top_n": top_k
+                    },
+                    timeout=30.0
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    reranked = []
+                    for item in data.get("results", []):
+                        idx = item.get("index", 0)
+                        if idx < len(results):
+                            result = results[idx]
+                            result.score = item.get("relevance_score", result.score)
+                            result.source = "zerank_reranked"
+                            reranked.append(result)
+                    return reranked
+
+        except Exception as e:
+            logger.warning(f"Zerank rerank failed, falling back: {e}")
+            # Fall back to Jina if available
+            if self.config.jina_key:
+                return await self._rerank_jina(query, results, top_k)
+
+        return results
+
     async def _rerank_jina(
         self,
         query: str,
         results: List[SearchResult],
         top_k: int
     ) -> List[SearchResult]:
-        """Rerank results using Jina."""
+        """Rerank results using Jina (fallback reranker)."""
         if not self.config.jina_key:
             return results
 
@@ -757,7 +822,8 @@ class UnifiedAPI:
                 "mem0": bool(self.config.mem0_key),
                 "voyage": bool(self.config.voyage_key),
                 "qdrant": bool(self.config.qdrant_key),
-                "jina": bool(self.config.jina_key),
+                "zerank": bool(self.config.zerank_key),  # 2026: Primary reranker
+                "jina": bool(self.config.jina_key),      # Fallback reranker
                 "perplexity": bool(self.config.perplexity_key),
                 "e2b": bool(self.config.e2b_key),
                 "langsmith": bool(self.config.langsmith_key),
