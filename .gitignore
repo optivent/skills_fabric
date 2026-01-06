@@ -12,3 +12,4 @@ build/
 data/
 *.db
 crawl_output/docling_repo/
+langgraph_repo
