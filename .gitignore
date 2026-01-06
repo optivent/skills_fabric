@@ -11,3 +11,4 @@ build/
 .pytest_cache/
 data/
 *.db
+crawl_output/docling_repo/
