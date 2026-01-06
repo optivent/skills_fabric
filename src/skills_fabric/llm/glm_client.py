@@ -3,20 +3,26 @@
 Connects to Z.ai API for GLM-4.7 coding model access.
 Supports preserved thinking for multi-turn coding agents.
 
+IMPORTANT: Two separate endpoints exist:
+- Coding endpoint: https://api.z.ai/api/coding/paas/v4 (for Coding Plan)
+- General endpoint: https://api.z.ai/api/paas/v4 (for standard API)
+
+This client defaults to the CODING endpoint for use with coding tools.
+
 Features:
 - OpenAI-compatible API
 - Preserved thinking mode (reasoning persists across turns)
 - Streaming support
-- Cost tracking ($0.60/1M in, $2.20/1M out)
+- Cost tracking (Coding Plan: reduced rates)
 
 Usage:
     from skills_fabric.llm import GLMClient
 
+    # Coding Plan (default)
     client = GLMClient(api_key="your-key")
-    response = client.generate(
-        messages=[{"role": "user", "content": "Write a function..."}],
-        thinking=True,
-    )
+
+    # Or explicitly use general API
+    client = GLMClient(api_key="your-key", use_coding_endpoint=False)
 """
 from dataclasses import dataclass, field
 from typing import Optional, Iterator, Any
@@ -72,12 +78,18 @@ class GLMResponse:
         return self.thinking is not None and len(self.thinking) > 0
 
 
+# API Endpoints
+CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+GENERAL_BASE_URL = "https://api.z.ai/api/paas/v4"
+
+
 @dataclass
 class GLMConfig:
     """Configuration for GLM client."""
     api_key: str = ""
-    base_url: str = "https://api.z.ai/api/paas/v4"
+    base_url: str = CODING_BASE_URL  # Default to coding endpoint
     model: str = "glm-4.7"
+    use_coding_endpoint: bool = True  # Use coding endpoint by default
     max_tokens: int = 4096
     temperature: float = 1.0
     top_p: float = 0.95
@@ -85,12 +97,31 @@ class GLMConfig:
     thinking_mode: ThinkingMode = ThinkingMode.ENABLED
 
     @classmethod
-    def from_env(cls) -> "GLMConfig":
-        """Create config from environment variables."""
+    def from_env(cls, use_coding_endpoint: bool = True) -> "GLMConfig":
+        """Create config from environment variables.
+
+        Args:
+            use_coding_endpoint: Use coding endpoint (default True)
+
+        Environment variables:
+            ZAI_API_KEY or GLM_API_KEY: API key
+            ZAI_BASE_URL: Override base URL
+            ZAI_USE_CODING: Set to "false" to use general endpoint
+            GLM_MODEL: Model name (default glm-4.7)
+        """
+        # Check env var for endpoint preference
+        env_use_coding = os.getenv("ZAI_USE_CODING", "true").lower() != "false"
+        use_coding = use_coding_endpoint and env_use_coding
+
+        # Determine base URL
+        default_url = CODING_BASE_URL if use_coding else GENERAL_BASE_URL
+        base_url = os.getenv("ZAI_BASE_URL", default_url)
+
         return cls(
             api_key=os.getenv("ZAI_API_KEY", os.getenv("GLM_API_KEY", "")),
-            base_url=os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4"),
+            base_url=base_url,
             model=os.getenv("GLM_MODEL", "glm-4.7"),
+            use_coding_endpoint=use_coding,
         )
 
 
@@ -99,23 +130,27 @@ class GLMClient:
 
     Supports both sync and async operations.
     Compatible with OpenAI message format.
+
+    Uses the CODING endpoint by default for Coding Plan subscribers.
     """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         config: Optional[GLMConfig] = None,
+        use_coding_endpoint: bool = True,
     ):
         """Initialize GLM client.
 
         Args:
             api_key: Z.ai API key (or set ZAI_API_KEY env var)
             config: Optional full configuration
+            use_coding_endpoint: Use coding endpoint (default True)
         """
         if config:
             self.config = config
         else:
-            self.config = GLMConfig.from_env()
+            self.config = GLMConfig.from_env(use_coding_endpoint=use_coding_endpoint)
             if api_key:
                 self.config.api_key = api_key
 
