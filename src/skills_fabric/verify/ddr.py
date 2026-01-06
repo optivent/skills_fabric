@@ -292,28 +292,38 @@ class DirectDependencyRetriever:
         )
 
     def _search_symbols(self, query: str) -> list[dict]:
-        """Search symbol index for matches."""
-        results = []
+        """Search symbol index for matches.
+
+        Priority order:
+        1. Exact matches (highest priority for zero-hallucination)
+        2. Partial matches (query in symbol name)
+        3. Word matches (query words in symbol)
+        """
+        exact_matches = []
+        partial_matches = []
+        word_matches = []
+
         query_lower = query.lower()
         query_parts = set(query_lower.split())
 
         for symbol_name, entries in self._symbol_index.items():
-            # Exact match
+            # Exact match (highest priority)
             if symbol_name == query_lower:
-                results.extend(entries)
+                exact_matches.extend(entries)
                 continue
 
-            # Partial match
+            # Partial match (query contained in symbol)
             if query_lower in symbol_name:
-                results.extend(entries)
+                partial_matches.extend(entries)
                 continue
 
             # Word match (e.g., "state graph" matches "StateGraph")
             symbol_words = set(re.findall(r'[a-z]+', symbol_name))
             if query_parts & symbol_words:
-                results.extend(entries)
+                word_matches.extend(entries)
 
-        return results
+        # Return in priority order: exact first, then partial, then word
+        return exact_matches + partial_matches + word_matches
 
     def _validate_and_extract(self, candidate: dict) -> Optional[CodeElement]:
         """Validate candidate exists and extract actual content."""
