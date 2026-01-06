@@ -370,6 +370,217 @@ Follow best practices for {language}."""
         """Reset usage tracking."""
         self._total_usage = TokenUsage()
 
+    # =========================================================================
+    # Tool Calling / Function Calling
+    # =========================================================================
+
+    def generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        **kwargs,
+    ) -> GLMResponse:
+        """Generate response with tool/function calling.
+
+        Args:
+            messages: Conversation messages
+            tools: List of tool definitions (OpenAI format)
+            tool_choice: "auto", "none", or specific tool name
+            **kwargs: Additional parameters
+
+        Returns:
+            GLMResponse (check for tool_calls in response)
+
+        Example tool definition:
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"}
+                        },
+                        "required": ["location"]
+                    }
+                }
+            }
+        """
+        return self.generate(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            thinking=True,
+            **kwargs,
+        )
+
+    # =========================================================================
+    # Web Search API (uses general endpoint, not coding endpoint)
+    # =========================================================================
+
+    def web_search(
+        self,
+        query: str,
+        search_engine: str = "search_std",
+        search_result_depth: str = "basic",
+    ) -> dict:
+        """Search the web using Z.ai's LLM-optimized search.
+
+        Args:
+            query: Search query
+            search_engine: "search_std" (standard) or "search_pro" (detailed)
+            search_result_depth: "basic" or "advanced"
+
+        Returns:
+            Search results with titles, URLs, summaries
+
+        Note: Uses general endpoint as web_search is not available on coding endpoint.
+        """
+        # Web search uses general endpoint, not coding endpoint
+        endpoint = f"{GENERAL_BASE_URL}/web_search"
+
+        payload = {
+            "search_engine": search_engine,
+            "search_result_depth": search_result_depth,
+            "query": query,
+        }
+
+        if HTTPX_AVAILABLE:
+            with httpx.Client(timeout=self.config.timeout) as client:
+                response = client.post(endpoint, headers=self.headers, json=payload)
+                response.raise_for_status()
+                return response.json()
+        else:
+            response = requests.post(
+                endpoint, headers=self.headers, json=payload, timeout=self.config.timeout
+            )
+            response.raise_for_status()
+            return response.json()
+
+    # =========================================================================
+    # Web Reader API (uses general endpoint, not coding endpoint)
+    # =========================================================================
+
+    def read_url(
+        self,
+        url: str,
+        return_format: str = "markdown",
+        cache: bool = True,
+        generate_summary: bool = False,
+    ) -> dict:
+        """Read and parse content from a URL.
+
+        Args:
+            url: URL to read
+            return_format: "markdown", "html", or "text"
+            cache: Use cached version if available
+            generate_summary: Include AI-generated summary
+
+        Returns:
+            Parsed content with title, content, and optional summary
+
+        Note: Uses general endpoint as reader is not available on coding endpoint.
+        """
+        # Reader uses general endpoint, not coding endpoint
+        endpoint = f"{GENERAL_BASE_URL}/reader"
+
+        payload = {
+            "url": url,
+            "return_format": return_format,
+            "cache": cache,
+            "generate_summary": generate_summary,
+        }
+
+        if HTTPX_AVAILABLE:
+            with httpx.Client(timeout=self.config.timeout) as client:
+                response = client.post(endpoint, headers=self.headers, json=payload)
+                response.raise_for_status()
+                return response.json()
+        else:
+            response = requests.post(
+                endpoint, headers=self.headers, json=payload, timeout=self.config.timeout
+            )
+            response.raise_for_status()
+            return response.json()
+
+    # =========================================================================
+    # Tokenizer API (uses general endpoint, not coding endpoint)
+    # =========================================================================
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in text.
+
+        Args:
+            text: Text to tokenize
+
+        Returns:
+            Token count
+
+        Note: Uses general endpoint as tokenizer is not available on coding endpoint.
+        """
+        # Tokenizer uses general endpoint, not coding endpoint
+        endpoint = f"{GENERAL_BASE_URL}/tokenizer"
+
+        payload = {
+            "model": self.config.model,
+            "input": text,
+        }
+
+        if HTTPX_AVAILABLE:
+            with httpx.Client(timeout=self.config.timeout) as client:
+                response = client.post(endpoint, headers=self.headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+        else:
+            response = requests.post(
+                endpoint, headers=self.headers, json=payload, timeout=self.config.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        return data.get("total_tokens", 0)
+
+    # =========================================================================
+    # Research Helper (combines web search + chat)
+    # =========================================================================
+
+    def research(
+        self,
+        query: str,
+        follow_up_question: Optional[str] = None,
+    ) -> GLMResponse:
+        """Research a topic using web search + GLM analysis.
+
+        Args:
+            query: Research query
+            follow_up_question: Optional specific question about results
+
+        Returns:
+            GLMResponse with synthesized research
+        """
+        # First, search the web
+        search_results = self.web_search(query)
+
+        # Format results for context
+        context_parts = ["Web search results:\n"]
+        for result in search_results.get("results", [])[:5]:
+            title = result.get("title", "")
+            url = result.get("url", "")
+            summary = result.get("summary", "")
+            context_parts.append(f"- {title}\n  URL: {url}\n  {summary}\n")
+
+        context = "\n".join(context_parts)
+
+        # Generate response with context
+        prompt = follow_up_question or f"Based on the search results, provide a comprehensive answer about: {query}"
+
+        return self.chat(
+            user_message=f"{context}\n\n{prompt}",
+            thinking=True,
+        )
+
 
 class GLMCodingAgent:
     """Coding agent using GLM-4.7 with preserved thinking.
