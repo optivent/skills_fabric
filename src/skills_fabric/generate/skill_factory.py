@@ -151,16 +151,23 @@ class SkillFactory:
         
         print('[Link] Creating PROVEN links...')
         
-        # First, store symbols in database
+        # First, store symbols in database (using parameterized queries)
         for symbol in state['symbols'][:100]:  # Limit for speed
             try:
-                self.db.execute(f"""
-                    CREATE (s:Symbol {{
-                        name: '{symbol["name"]}',
-                        file_path: '{symbol["file_path"]}',
-                        line: {symbol["line"]}
-                    }})
-                """)
+                self.db.execute(
+                    """
+                    CREATE (s:Symbol {
+                        name: $name,
+                        file_path: $file_path,
+                        line: $line
+                    })
+                    """,
+                    {
+                        "name": symbol["name"],
+                        "file_path": symbol["file_path"],
+                        "line": symbol["line"]
+                    }
+                )
             except Exception:
                 pass  # Already exists
         

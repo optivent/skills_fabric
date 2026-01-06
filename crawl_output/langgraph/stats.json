@@ -1,0 +1,17 @@
+{
+  "commit": "8ccead9560f6",
+  "total_symbols": 3296,
+  "total_sections": 2018,
+  "modules": {
+    "prebuilt": 493,
+    "sdk-py": 643,
+    "checkpoint-sqlite": 271,
+    "sdk-js": 0,
+    "checkpoint-postgres": 291,
+    "checkpoint": 490,
+    "cli": 266,
+    "langgraph": 3142
+  },
+  "docs_files": 158,
+  "generated": "2026-01-06T10:57:17.450300"
+}
