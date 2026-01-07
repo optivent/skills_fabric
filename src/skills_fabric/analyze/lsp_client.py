@@ -741,11 +741,17 @@ class LSPClient:
             end_column=end.get("character") if end else None
         )
     
-    def get_references(self, file: Path, line: int, col: int) -> list[Location]:
-        """Find all references to symbol.
+    def get_references(
+        self,
+        file: Path,
+        line: int,
+        col: int,
+        include_declaration: bool = True
+    ) -> list[Location]:
+        """Find all references to symbol across the codebase.
 
-        Returns all locations where the symbol at the given position is used,
-        including the definition location.
+        Returns all locations where the symbol at the given position is used.
+        By default, includes the definition location in the results.
 
         Uses 0-indexed positions per LSP specification.
 
@@ -753,6 +759,7 @@ class LSPClient:
             file: File path
             line: Line number (0-indexed)
             col: Column number (0-indexed)
+            include_declaration: If True, include the definition location in results
 
         Returns:
             List of Location objects with file:line citations
@@ -760,7 +767,7 @@ class LSPClient:
         result = self._send_request("textDocument/references", {
             "textDocument": {"uri": f"file://{file}"},
             "position": {"line": line, "character": col},
-            "context": {"includeDeclaration": True}
+            "context": {"includeDeclaration": include_declaration}
         })
 
         if not result or not isinstance(result, list):
@@ -773,6 +780,105 @@ class LSPClient:
                 locations.append(location)
 
         return locations
+
+    def find_references(
+        self,
+        file: Path,
+        line: int,
+        col: int,
+        include_declaration: bool = True,
+        auto_open: bool = True
+    ) -> list[str]:
+        """Find all references and return as file:line citation strings.
+
+        A convenience method that returns ready-to-use file:line citations
+        for documentation. Optionally handles document opening/closing automatically.
+
+        Args:
+            file: File path
+            line: Line number (0-indexed per LSP spec)
+            col: Column number (0-indexed per LSP spec)
+            include_declaration: If True, include the definition location in results
+            auto_open: If True, automatically open and close the document
+
+        Returns:
+            List of citation strings like ["path/to/file.py:42", "path/to/other.py:10"]
+            (1-indexed for human readability)
+
+        Example:
+            >>> client.find_references(Path("src/main.py"), 10, 5)
+            ['src/main.py:11', 'src/utils.py:25', 'tests/test_main.py:42']
+        """
+        try:
+            if auto_open:
+                self.open_document(file)
+
+            locations = self.get_references(file, line, col, include_declaration)
+            return [loc.to_citation() for loc in locations]
+
+        finally:
+            if auto_open:
+                self.close_document(file)
+
+    def get_references_count(
+        self,
+        file: Path,
+        line: int,
+        col: int,
+        include_declaration: bool = True
+    ) -> int:
+        """Get the count of references to a symbol.
+
+        A quick way to check how many places reference a symbol
+        without needing the full location details.
+
+        Args:
+            file: File path
+            line: Line number (0-indexed)
+            col: Column number (0-indexed)
+            include_declaration: If True, include the definition in the count
+
+        Returns:
+            Number of references found
+        """
+        return len(self.get_references(file, line, col, include_declaration))
+
+    def get_references_by_file(
+        self,
+        file: Path,
+        line: int,
+        col: int,
+        include_declaration: bool = True
+    ) -> dict[str, list[Location]]:
+        """Find all references grouped by file.
+
+        Useful for understanding the scope of impact when refactoring
+        or analyzing symbol usage patterns across the codebase.
+
+        Args:
+            file: File path
+            line: Line number (0-indexed)
+            col: Column number (0-indexed)
+            include_declaration: If True, include the definition location
+
+        Returns:
+            Dictionary mapping file paths to lists of Location objects
+            in that file
+
+        Example:
+            >>> refs = client.get_references_by_file(Path("src/main.py"), 10, 5)
+            >>> for filepath, locations in refs.items():
+            ...     print(f"{filepath}: {len(locations)} references")
+        """
+        all_refs = self.get_references(file, line, col, include_declaration)
+
+        by_file: dict[str, list[Location]] = {}
+        for loc in all_refs:
+            if loc.file not in by_file:
+                by_file[loc.file] = []
+            by_file[loc.file].append(loc)
+
+        return by_file
     
     def get_document_symbols(self, file: Path) -> list[LSPSymbol]:
         """Get all symbols in a document.
