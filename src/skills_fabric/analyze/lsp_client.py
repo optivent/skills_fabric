@@ -344,6 +344,22 @@ class LSPClient:
         self._running = False
         # Lock for sending messages
         self._send_lock = threading.Lock()
+        # Track if server initialization failed
+        self._initialization_failed = False
+
+    @property
+    def is_available(self) -> bool:
+        """Check if the LSP server is running and available.
+
+        Returns:
+            True if the server is running and initialized, False otherwise.
+        """
+        return (
+            self._process is not None
+            and self._process.poll() is None
+            and self._running
+            and not self._initialization_failed
+        )
     
     def start_server(self, project_path: Path, language: str) -> bool:
         """Start the appropriate LSP server.
@@ -409,9 +425,11 @@ class LSPClient:
 
         except FileNotFoundError:
             logger.warning(f"LSP server not installed: {cmd[0]}")
+            self._initialization_failed = True
             return False
         except Exception as e:
             logger.error(f"Error starting LSP server: {e}")
+            self._initialization_failed = True
             return False
     
     def stop_server(self):
@@ -1110,3 +1128,7 @@ class LSPClient:
             25: "operator", 26: "type_parameter"
         }
         return kinds.get(kind, "unknown")
+
+
+# Note: CodeAnalyzer with LSP/AST fallback is now in code_analyzer.py
+# This module focuses on pure LSP client functionality

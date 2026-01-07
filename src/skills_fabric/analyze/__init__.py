@@ -4,6 +4,7 @@ This package provides various code analysis tools:
 - ast_parser: Python AST parsing with rich metadata extraction
 - tree_sitter: Multi-language parsing using Tree-sitter
 - lsp_client: Language Server Protocol client
+- code_analyzer: Unified analyzer with LSP-to-AST graceful degradation
 - symbol_graph: Symbol relationship graph building
 
 Symbol Types:
@@ -22,6 +23,16 @@ Usage:
     ts_parser = TreeSitterParser()
     ts_symbols = ts_parser.parse_file(Path("example.ts"))  # Returns TSSymbol
     enhanced = ts_symbols[0].to_enhanced()  # Convert to EnhancedSymbol
+
+    # Unified analysis with LSP fallback (graceful degradation)
+    from skills_fabric.analyze import CodeAnalyzer, AnalysisResult
+
+    with CodeAnalyzer(project_path=Path(".")) as analyzer:
+        result = analyzer.analyze_file(Path("example.py"))
+        if analyzer.is_degraded:
+            print("Running in AST-only mode (LSP unavailable)")
+        for symbol in result.symbols:
+            print(f"{symbol.kind}: {symbol.name}")
 """
 
 from skills_fabric.analyze.ast_parser import (
@@ -42,6 +53,12 @@ from skills_fabric.analyze.lsp_client import (
     HoverInfo,
     LSPSymbol,
 )
+from skills_fabric.analyze.code_analyzer import (
+    CodeAnalyzer,
+    AnalysisMode,
+    AnalysisResult,
+    analyze_file_with_fallback,
+)
 
 __all__ = [
     # AST Parser
@@ -59,4 +76,9 @@ __all__ = [
     "Location",
     "HoverInfo",
     "LSPSymbol",
+    # Unified Analyzer with fallback
+    "CodeAnalyzer",
+    "AnalysisMode",
+    "AnalysisResult",
+    "analyze_file_with_fallback",
 ]
