@@ -14,6 +14,7 @@ Features:
 - Preserved thinking mode (reasoning persists across turns)
 - thinking_budget parameter for controlling reasoning token limits
 - Thinking metrics tracking and logging
+- Reasoning fallback: automatic retry without thinking when reasoning fails
 - Streaming support
 - Cost tracking (Coding Plan: reduced rates)
 
@@ -40,6 +41,14 @@ Usage:
     )
     print(f"Thinking tokens used: {response.usage.thinking_tokens}")
     print(f"Budget used: {response.usage.thinking_budget_used_pct:.1f}%")
+
+    # With automatic fallback when reasoning fails
+    response = client.generate_with_fallback(
+        messages=[{"role": "user", "content": "Explain this code"}],
+        thinking_budget=16000
+    )
+    if response.used_fallback:
+        print("Reasoning failed, used non-thinking fallback")
 
     # Multi-turn agent with preserved thinking
     agent = GLMCodingAgent(thinking_budget=24000)
@@ -71,6 +80,73 @@ class ThinkingMode(Enum):
     DISABLED = "disabled"
     ENABLED = "enabled"
     PRESERVED = "preserved"  # Keeps thinking across turns
+
+
+class ReasoningFailureType(Enum):
+    """Types of reasoning failures that can trigger fallback."""
+    NONE = "none"  # No failure
+    BUDGET_EXHAUSTED = "budget_exhausted"  # Thinking budget fully consumed
+    EMPTY_THINKING = "empty_thinking"  # Thinking enabled but no reasoning returned
+    API_ERROR = "api_error"  # API returned an error during thinking
+    TIMEOUT = "timeout"  # Request timed out during reasoning
+    MALFORMED_RESPONSE = "malformed_response"  # Response format unexpected
+    TRUNCATED_OUTPUT = "truncated_output"  # Output appears cut off
+
+
+@dataclass
+class ReasoningMetrics:
+    """Metrics for reasoning/thinking operations.
+
+    Tracks performance and success rates for thinking mode operations.
+    Useful for monitoring and debugging reasoning quality.
+    """
+    total_requests: int = 0
+    thinking_requests: int = 0
+    fallback_requests: int = 0
+    successful_thinking: int = 0
+    failed_thinking: int = 0
+    total_thinking_tokens: int = 0
+    total_thinking_budget: int = 0
+    budget_exhausted_count: int = 0
+    empty_thinking_count: int = 0
+    api_error_count: int = 0
+    timeout_count: int = 0
+
+    @property
+    def thinking_success_rate(self) -> float:
+        """Percentage of thinking requests that succeeded."""
+        if self.thinking_requests == 0:
+            return 100.0
+        return (self.successful_thinking / self.thinking_requests) * 100
+
+    @property
+    def fallback_rate(self) -> float:
+        """Percentage of requests that fell back to non-thinking mode."""
+        if self.total_requests == 0:
+            return 0.0
+        return (self.fallback_requests / self.total_requests) * 100
+
+    @property
+    def avg_budget_utilization(self) -> float:
+        """Average percentage of thinking budget used."""
+        if self.total_thinking_budget == 0:
+            return 0.0
+        return (self.total_thinking_tokens / self.total_thinking_budget) * 100
+
+    def to_dict(self) -> dict:
+        """Convert metrics to dictionary for logging/serialization."""
+        return {
+            "total_requests": self.total_requests,
+            "thinking_requests": self.thinking_requests,
+            "fallback_requests": self.fallback_requests,
+            "thinking_success_rate_pct": round(self.thinking_success_rate, 2),
+            "fallback_rate_pct": round(self.fallback_rate, 2),
+            "avg_budget_utilization_pct": round(self.avg_budget_utilization, 2),
+            "budget_exhausted_count": self.budget_exhausted_count,
+            "empty_thinking_count": self.empty_thinking_count,
+            "api_error_count": self.api_error_count,
+            "timeout_count": self.timeout_count,
+        }
 
 
 @dataclass
@@ -115,6 +191,10 @@ class GLMResponse:
     model: str = "glm-4.7"
     latency_ms: float = 0.0
     thinking_budget_used: int = 0  # How many thinking tokens were used
+    # Fallback-related fields
+    used_fallback: bool = False  # True if fell back to non-thinking mode
+    fallback_reason: ReasoningFailureType = ReasoningFailureType.NONE
+    original_error: Optional[str] = None  # Error message if fallback was triggered
 
     @property
     def has_thinking(self) -> bool:
@@ -125,6 +205,26 @@ class GLMResponse:
     def thinking_truncated(self) -> bool:
         """Check if thinking may have been truncated due to budget limits."""
         return self.usage.thinking_budget_exhausted
+
+    @property
+    def reasoning_quality(self) -> str:
+        """Assess the quality of reasoning in this response.
+
+        Returns:
+            'excellent': Full thinking with budget room to spare
+            'good': Thinking completed but used significant budget
+            'degraded': Budget exhausted, reasoning may be incomplete
+            'failed': No thinking (fallback used or disabled)
+        """
+        if self.used_fallback:
+            return "failed"
+        if not self.has_thinking:
+            return "failed"
+        if self.thinking_truncated:
+            return "degraded"
+        if self.usage.thinking_budget_used_pct > 80:
+            return "good"
+        return "excellent"
 
 
 # API Endpoints
@@ -216,6 +316,7 @@ class GLMClient:
 
         self._session = None
         self._total_usage = TokenUsage()
+        self._reasoning_metrics = ReasoningMetrics()
 
     @property
     def headers(self) -> dict:
@@ -308,6 +409,275 @@ class GLMClient:
             return self._parse_response(
                 response, latency_ms, thinking_budget=budget if thinking else 0
             )
+
+    def generate_with_fallback(
+        self,
+        messages: list[dict],
+        thinking_budget: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        auto_increase_budget: bool = False,
+        **kwargs,
+    ) -> GLMResponse:
+        """Generate response with automatic fallback on reasoning failure.
+
+        Tries thinking mode first. If reasoning fails or is truncated,
+        automatically retries without thinking mode to ensure a response.
+
+        Args:
+            messages: List of messages in OpenAI format
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
+            max_tokens: Override max tokens
+            temperature: Override temperature
+            auto_increase_budget: If True and budget exhausted, retry with 2x budget
+                                  before falling back to non-thinking
+            **kwargs: Additional parameters
+
+        Returns:
+            GLMResponse with content. Check used_fallback and fallback_reason
+            to determine if fallback was triggered.
+
+        Example:
+            response = client.generate_with_fallback(
+                messages=[{"role": "user", "content": "Explain this code"}],
+                thinking_budget=16000
+            )
+            if response.used_fallback:
+                print(f"Fallback used: {response.fallback_reason.value}")
+            else:
+                print(f"Reasoning quality: {response.reasoning_quality}")
+        """
+        budget = thinking_budget or self.config.thinking_budget
+
+        # Update metrics
+        self._reasoning_metrics.total_requests += 1
+        self._reasoning_metrics.thinking_requests += 1
+
+        # First attempt: with thinking
+        try:
+            response = self.generate(
+                messages=messages,
+                thinking=True,
+                thinking_budget=budget,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=False,
+                **kwargs,
+            )
+
+            # Check for reasoning failure
+            failure_type = self._detect_reasoning_failure(response)
+
+            if failure_type == ReasoningFailureType.NONE:
+                # Success - log and return
+                self._reasoning_metrics.successful_thinking += 1
+                self._reasoning_metrics.total_thinking_tokens += response.usage.thinking_tokens
+                self._reasoning_metrics.total_thinking_budget += budget
+                self._log_reasoning_metrics(response, "success")
+                return response
+
+            # Handle budget exhaustion with optional retry at higher budget
+            if failure_type == ReasoningFailureType.BUDGET_EXHAUSTED:
+                self._reasoning_metrics.budget_exhausted_count += 1
+
+                if auto_increase_budget and budget < 64000:
+                    # Retry with 2x budget before giving up
+                    new_budget = min(budget * 2, 64000)
+                    logger.info(
+                        f"Reasoning budget exhausted ({budget} tokens). "
+                        f"Retrying with increased budget ({new_budget} tokens)."
+                    )
+                    return self.generate_with_fallback(
+                        messages=messages,
+                        thinking_budget=new_budget,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        auto_increase_budget=False,  # Only retry once
+                        **kwargs,
+                    )
+
+                # Budget exhausted but response exists - return with warning
+                self._reasoning_metrics.failed_thinking += 1
+                self._log_reasoning_metrics(
+                    response, "degraded", f"budget_exhausted ({response.usage.thinking_tokens}/{budget})"
+                )
+                return response  # Return degraded response, not fallback
+
+            # Handle empty thinking
+            if failure_type == ReasoningFailureType.EMPTY_THINKING:
+                self._reasoning_metrics.empty_thinking_count += 1
+                logger.warning(
+                    "Thinking mode enabled but no reasoning returned. "
+                    "Falling back to non-thinking mode."
+                )
+
+            # Fallback to non-thinking mode
+            return self._execute_fallback(
+                messages=messages,
+                failure_type=failure_type,
+                original_error=None,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+
+        except Exception as e:
+            # API error or timeout - fallback to non-thinking
+            error_msg = str(e)
+
+            # Categorize the error
+            if "timeout" in error_msg.lower():
+                failure_type = ReasoningFailureType.TIMEOUT
+                self._reasoning_metrics.timeout_count += 1
+            else:
+                failure_type = ReasoningFailureType.API_ERROR
+                self._reasoning_metrics.api_error_count += 1
+
+            logger.warning(
+                f"Thinking request failed with error: {error_msg}. "
+                f"Falling back to non-thinking mode."
+            )
+
+            return self._execute_fallback(
+                messages=messages,
+                failure_type=failure_type,
+                original_error=error_msg,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+
+    def _detect_reasoning_failure(self, response: GLMResponse) -> ReasoningFailureType:
+        """Detect type of reasoning failure in a response.
+
+        Args:
+            response: GLMResponse to analyze
+
+        Returns:
+            ReasoningFailureType indicating the failure (or NONE if successful)
+        """
+        # Check for budget exhaustion (may still have valid response)
+        if response.thinking_truncated:
+            return ReasoningFailureType.BUDGET_EXHAUSTED
+
+        # Check for empty thinking when it was expected
+        if not response.has_thinking and response.usage.thinking_budget > 0:
+            # Thinking was enabled but no reasoning returned
+            return ReasoningFailureType.EMPTY_THINKING
+
+        # Check for truncated output (finish_reason indicates cutoff)
+        if response.finish_reason == "length":
+            return ReasoningFailureType.TRUNCATED_OUTPUT
+
+        # Check for malformed/empty content
+        if not response.content or not response.content.strip():
+            return ReasoningFailureType.MALFORMED_RESPONSE
+
+        return ReasoningFailureType.NONE
+
+    def _execute_fallback(
+        self,
+        messages: list[dict],
+        failure_type: ReasoningFailureType,
+        original_error: Optional[str],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        **kwargs,
+    ) -> GLMResponse:
+        """Execute fallback request without thinking mode.
+
+        Args:
+            messages: List of messages
+            failure_type: Why fallback was triggered
+            original_error: Original error message if any
+            max_tokens: Override max tokens
+            temperature: Override temperature
+            **kwargs: Additional parameters
+
+        Returns:
+            GLMResponse with fallback information
+        """
+        self._reasoning_metrics.failed_thinking += 1
+        self._reasoning_metrics.fallback_requests += 1
+
+        try:
+            # Make request without thinking
+            response = self.generate(
+                messages=messages,
+                thinking=False,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=False,
+                **kwargs,
+            )
+
+            # Mark as fallback
+            response.used_fallback = True
+            response.fallback_reason = failure_type
+            response.original_error = original_error
+
+            self._log_reasoning_metrics(
+                response, "fallback", f"{failure_type.value}: {original_error or 'N/A'}"
+            )
+
+            return response
+
+        except Exception as e:
+            # Even fallback failed - create error response
+            logger.error(f"Fallback request also failed: {e}")
+            raise
+
+    def _log_reasoning_metrics(
+        self,
+        response: GLMResponse,
+        status: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Log reasoning metrics for observability.
+
+        Args:
+            response: The GLMResponse
+            status: 'success', 'degraded', or 'fallback'
+            detail: Optional detail message
+        """
+        metrics = {
+            "status": status,
+            "thinking_tokens": response.usage.thinking_tokens,
+            "thinking_budget": response.usage.thinking_budget,
+            "budget_used_pct": round(response.usage.thinking_budget_used_pct, 1),
+            "latency_ms": round(response.latency_ms, 1),
+            "model": response.model,
+        }
+
+        if detail:
+            metrics["detail"] = detail
+
+        if response.used_fallback:
+            metrics["fallback_reason"] = response.fallback_reason.value
+
+        if status == "success":
+            logger.debug(f"Reasoning metrics: {metrics}")
+        elif status == "degraded":
+            logger.warning(f"Reasoning degraded: {metrics}")
+        else:
+            logger.info(f"Reasoning fallback: {metrics}")
+
+    def get_reasoning_metrics(self) -> ReasoningMetrics:
+        """Get cumulative reasoning metrics.
+
+        Returns:
+            ReasoningMetrics with statistics about thinking operations
+        """
+        return self._reasoning_metrics
+
+    def reset_reasoning_metrics(self) -> None:
+        """Reset reasoning metrics to initial state."""
+        self._reasoning_metrics = ReasoningMetrics()
+
+    def log_reasoning_summary(self) -> None:
+        """Log a summary of reasoning metrics."""
+        metrics = self._reasoning_metrics.to_dict()
+        logger.info(f"Reasoning summary: {json.dumps(metrics, indent=2)}")
 
     def _request_httpx(self, payload: dict, stream: bool) -> Any:
         """Make request using httpx."""
@@ -456,6 +826,8 @@ Follow best practices for {language}."""
         language: str = "python",
         thinking_budget: Optional[int] = None,
         detail_level: str = "comprehensive",
+        use_fallback: bool = False,
+        auto_increase_budget: bool = False,
     ) -> GLMResponse:
         """Explain code using GLM-4.7 with thinking mode.
 
@@ -467,6 +839,10 @@ Follow best practices for {language}."""
             language: Programming language of the code
             thinking_budget: Max reasoning tokens (default: 24000 for explanation tasks)
             detail_level: "brief", "moderate", or "comprehensive"
+            use_fallback: If True, use generate_with_fallback for automatic
+                         fallback to non-thinking mode on failures
+            auto_increase_budget: If True with use_fallback, retry with 2x budget
+                                  before falling back to non-thinking
 
         Returns:
             GLMResponse with explanation and thinking process
@@ -484,9 +860,12 @@ Follow best practices for {language}."""
                     return quicksort(left) + middle + quicksort(right)
                 \"\"\",
                 language="python",
-                thinking_budget=32000
+                thinking_budget=32000,
+                use_fallback=True  # Automatically fallback if reasoning fails
             )
             print(f"Thinking used: {response.usage.thinking_budget_used_pct:.1f}%")
+            if response.used_fallback:
+                print(f"Fallback reason: {response.fallback_reason.value}")
             print(response.content)
         """
         # Use higher default budget for explanation tasks (reasoning-heavy)
@@ -520,7 +899,7 @@ Use your thinking process to analyze the code deeply before explaining.
         # Log the reasoning task
         logger.debug(
             f"explain_code: language={language}, detail={detail_level}, "
-            f"budget={budget}, code_len={len(code)}"
+            f"budget={budget}, code_len={len(code)}, use_fallback={use_fallback}"
         )
 
         messages = [
@@ -528,14 +907,28 @@ Use your thinking process to analyze the code deeply before explaining.
             {"role": "user", "content": user_message},
         ]
 
-        response = self.generate(
-            messages=messages,
-            thinking=True,
-            thinking_budget=budget,
-        )
+        # Use fallback method if requested
+        if use_fallback:
+            response = self.generate_with_fallback(
+                messages=messages,
+                thinking_budget=budget,
+                auto_increase_budget=auto_increase_budget,
+            )
+        else:
+            response = self.generate(
+                messages=messages,
+                thinking=True,
+                thinking_budget=budget,
+            )
 
         # Log thinking metrics
-        if response.usage.thinking_budget_exhausted:
+        if response.used_fallback:
+            logger.info(
+                f"explain_code: Used fallback mode. "
+                f"Reason: {response.fallback_reason.value}. "
+                f"Original error: {response.original_error or 'N/A'}"
+            )
+        elif response.usage.thinking_budget_exhausted:
             logger.warning(
                 f"explain_code: Thinking budget exhausted "
                 f"({response.usage.thinking_tokens}/{budget} tokens). "
@@ -780,6 +1173,12 @@ class GLMCodingAgent:
         response = agent.send("Explain how this code works")
         print(f"Thinking used: {response.thinking_budget_used} tokens")
         print(f"Response: {response.content}")
+
+        # With automatic fallback on reasoning failures
+        agent = GLMCodingAgent(thinking_budget=16000, use_fallback=True)
+        response = agent.send("Explain this complex algorithm")
+        if response.used_fallback:
+            print(f"Fallback triggered: {response.fallback_reason.value}")
     """
 
     def __init__(
@@ -787,6 +1186,8 @@ class GLMCodingAgent:
         client: Optional[GLMClient] = None,
         system_prompt: Optional[str] = None,
         thinking_budget: int = 16000,
+        use_fallback: bool = False,
+        auto_increase_budget: bool = False,
     ):
         """Initialize coding agent.
 
@@ -794,13 +1195,20 @@ class GLMCodingAgent:
             client: GLM client instance
             system_prompt: Custom system prompt
             thinking_budget: Max tokens for reasoning per turn (default 16K)
+            use_fallback: If True, automatically fallback to non-thinking mode
+                         when reasoning fails
+            auto_increase_budget: If True with use_fallback, retry with 2x budget
+                                  before falling back
         """
         self.client = client or GLMClient()
         self.system_prompt = system_prompt or self._default_system_prompt()
         self.thinking_budget = thinking_budget
+        self.use_fallback = use_fallback
+        self.auto_increase_budget = auto_increase_budget
         self.messages: list[dict] = []
         self.thinking_history: list[str] = []
         self.total_thinking_tokens: int = 0  # Track cumulative thinking usage
+        self.fallback_count: int = 0  # Track how many times fallback was used
 
         # Initialize with system prompt
         self.messages.append({
@@ -830,6 +1238,7 @@ Think step by step before providing solutions."""
         message: str,
         preserve_thinking: bool = True,
         thinking_budget: Optional[int] = None,
+        use_fallback: Optional[bool] = None,
     ) -> GLMResponse:
         """Send a message and get response.
 
@@ -837,6 +1246,8 @@ Think step by step before providing solutions."""
             message: User message
             preserve_thinking: Keep thinking across turns
             thinking_budget: Override thinking budget for this turn
+            use_fallback: Override use_fallback setting for this turn
+                         (uses instance default if not specified)
 
         Returns:
             GLMResponse
@@ -850,13 +1261,23 @@ Think step by step before providing solutions."""
         # Use provided budget or instance default
         budget = thinking_budget or self.thinking_budget
 
+        # Determine whether to use fallback
+        should_fallback = use_fallback if use_fallback is not None else self.use_fallback
+
         # Generate response
-        response = self.client.generate(
-            messages=self.messages,
-            thinking=True,
-            preserve_thinking=preserve_thinking,
-            thinking_budget=budget,
-        )
+        if should_fallback:
+            response = self.client.generate_with_fallback(
+                messages=self.messages,
+                thinking_budget=budget,
+                auto_increase_budget=self.auto_increase_budget,
+            )
+        else:
+            response = self.client.generate(
+                messages=self.messages,
+                thinking=True,
+                preserve_thinking=preserve_thinking,
+                thinking_budget=budget,
+            )
 
         # Add assistant response to history
         self.messages.append({
@@ -869,6 +1290,14 @@ Think step by step before providing solutions."""
             self.thinking_history.append(response.thinking)
         self.total_thinking_tokens += response.thinking_budget_used
 
+        # Track fallback usage
+        if response.used_fallback:
+            self.fallback_count += 1
+            logger.info(
+                f"GLMCodingAgent: Turn {len(self.thinking_history) + self.fallback_count} "
+                f"used fallback. Reason: {response.fallback_reason.value}"
+            )
+
         return response
 
     def reset(self):
@@ -879,6 +1308,7 @@ Think step by step before providing solutions."""
         }]
         self.thinking_history = []
         self.total_thinking_tokens = 0
+        self.fallback_count = 0
 
     def get_conversation(self) -> list[dict]:
         """Get full conversation history."""
@@ -888,14 +1318,21 @@ Think step by step before providing solutions."""
         """Get thinking token usage for this conversation.
 
         Returns:
-            dict with thinking usage metrics
+            dict with thinking usage metrics including fallback statistics
         """
+        total_turns = len(self.thinking_history) + self.fallback_count
         return {
             "total_thinking_tokens": self.total_thinking_tokens,
             "thinking_turns": len(self.thinking_history),
+            "fallback_turns": self.fallback_count,
+            "total_turns": total_turns,
             "average_per_turn": (
                 self.total_thinking_tokens / len(self.thinking_history)
                 if self.thinking_history else 0
+            ),
+            "fallback_rate_pct": (
+                (self.fallback_count / total_turns * 100)
+                if total_turns > 0 else 0.0
             ),
         }
 
