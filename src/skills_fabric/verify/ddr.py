@@ -23,6 +23,12 @@ Multi-Source Validation (Phase 5.2):
 - Tree-sitter for multi-language validation (Python, TypeScript, JavaScript)
 - LSP for cross-file references when available
 - Cross-checks symbols across multiple sources for higher confidence
+
+Hall_m Metric Tracking (Phase 5.3):
+- HallMetric class for comprehensive hallucination tracking
+- Per-batch and per-operation Hall_m logging
+- Configurable fail threshold (default: 0.02)
+- Metric history for analysis and debugging
 """
 from dataclasses import dataclass, field
 from enum import Enum
@@ -32,10 +38,400 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import json
 import time
+from datetime import datetime
 
 from ..observability.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# =========================================================================
+# HALL_M METRIC TRACKING (Phase 5.3)
+# =========================================================================
+
+
+class HallMetricExceededException(Exception):
+    """Exception raised when hallucination rate exceeds the threshold.
+
+    Used to fail fast when Hall_m >= 0.02 (configurable threshold).
+    """
+
+    def __init__(
+        self,
+        hall_m: float,
+        threshold: float,
+        validated: int,
+        rejected: int,
+        context: str = "",
+    ):
+        self.hall_m = hall_m
+        self.threshold = threshold
+        self.validated = validated
+        self.rejected = rejected
+        self.context = context
+        super().__init__(
+            f"Hall_m {hall_m:.4f} exceeds threshold {threshold:.4f} "
+            f"(validated={validated}, rejected={rejected})"
+            f"{f' - {context}' if context else ''}"
+        )
+
+
+@dataclass
+class HallMetricSnapshot:
+    """A snapshot of Hall_m metrics at a point in time.
+
+    Used for tracking metric history and trends.
+    """
+
+    timestamp: datetime
+    hall_m: float
+    validated: int
+    rejected: int
+    total_attempted: int
+    operation: str  # e.g., "retrieve", "batch", "validate"
+    context: str = ""  # e.g., query string or batch ID
+
+    @property
+    def success_rate(self) -> float:
+        """Return success rate (1 - hall_m)."""
+        return 1.0 - self.hall_m
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization."""
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "hall_m": self.hall_m,
+            "validated": self.validated,
+            "rejected": self.rejected,
+            "total_attempted": self.total_attempted,
+            "operation": self.operation,
+            "context": self.context,
+            "success_rate": self.success_rate,
+        }
+
+
+@dataclass
+class HallMetric:
+    """Hall_m metric calculator and tracker.
+
+    Tracks hallucination rate with configurable thresholds and logging.
+
+    Target: Hall_m < 0.02 (2% hallucination rate)
+
+    Formula: Hall_m = rejected_count / total_attempted
+    where total_attempted = validated_count + rejected_count
+
+    Usage:
+        metric = HallMetric()
+        metric.record(validated=95, rejected=5, operation="batch_query")
+
+        if metric.current_hall_m >= 0.02:
+            # Take corrective action
+            pass
+
+        # Or fail automatically:
+        metric.record_and_check(validated=8, rejected=3, fail_on_exceed=True)
+    """
+
+    threshold: float = 0.02  # Target: Hall_m < 0.02
+    fail_on_exceed: bool = False  # Whether to raise exception when exceeded
+    log_all: bool = True  # Log every metric recording
+    log_threshold_exceeded: bool = True  # Log warning when threshold exceeded
+
+    # Running totals
+    total_validated: int = field(default=0, init=False)
+    total_rejected: int = field(default=0, init=False)
+
+    # Metric history
+    history: list[HallMetricSnapshot] = field(default_factory=list, init=False)
+
+    # Session info
+    session_start: datetime = field(default_factory=datetime.now, init=False)
+
+    @property
+    def total_attempted(self) -> int:
+        """Total number of validation attempts."""
+        return self.total_validated + self.total_rejected
+
+    @property
+    def current_hall_m(self) -> float:
+        """Current cumulative hallucination rate."""
+        if self.total_attempted == 0:
+            return 0.0
+        return self.total_rejected / self.total_attempted
+
+    @property
+    def is_within_threshold(self) -> bool:
+        """Check if current Hall_m is within the acceptable threshold."""
+        return self.current_hall_m < self.threshold
+
+    @property
+    def is_exceeding_threshold(self) -> bool:
+        """Check if current Hall_m exceeds the threshold."""
+        return self.current_hall_m >= self.threshold
+
+    @staticmethod
+    def calculate(validated: int, rejected: int) -> float:
+        """Calculate Hall_m from validated and rejected counts.
+
+        Args:
+            validated: Number of validated elements.
+            rejected: Number of rejected elements.
+
+        Returns:
+            Hallucination rate between 0.0 and 1.0.
+        """
+        total = validated + rejected
+        if total == 0:
+            return 0.0
+        return rejected / total
+
+    def record(
+        self,
+        validated: int,
+        rejected: int,
+        operation: str = "unknown",
+        context: str = "",
+    ) -> HallMetricSnapshot:
+        """Record a metric observation.
+
+        Updates running totals and logs the metric.
+
+        Args:
+            validated: Number of validated elements.
+            rejected: Number of rejected elements.
+            operation: Type of operation (retrieve, batch, validate).
+            context: Additional context (e.g., query string).
+
+        Returns:
+            HallMetricSnapshot of this observation.
+        """
+        # Update totals
+        self.total_validated += validated
+        self.total_rejected += rejected
+
+        # Calculate Hall_m for this observation
+        hall_m = self.calculate(validated, rejected)
+
+        # Create snapshot
+        snapshot = HallMetricSnapshot(
+            timestamp=datetime.now(),
+            hall_m=hall_m,
+            validated=validated,
+            rejected=rejected,
+            total_attempted=validated + rejected,
+            operation=operation,
+            context=context[:100] if context else "",  # Truncate long contexts
+        )
+
+        # Add to history
+        self.history.append(snapshot)
+
+        # Log the metric
+        if self.log_all:
+            self._log_metric(snapshot)
+
+        # Check and warn if threshold exceeded
+        if self.log_threshold_exceeded and hall_m >= self.threshold:
+            self._log_threshold_exceeded(snapshot)
+
+        return snapshot
+
+    def record_and_check(
+        self,
+        validated: int,
+        rejected: int,
+        operation: str = "unknown",
+        context: str = "",
+        fail_on_exceed: Optional[bool] = None,
+    ) -> HallMetricSnapshot:
+        """Record a metric and check against threshold.
+
+        Like record(), but optionally raises HallMetricExceededException
+        if the observation exceeds the threshold.
+
+        Args:
+            validated: Number of validated elements.
+            rejected: Number of rejected elements.
+            operation: Type of operation.
+            context: Additional context.
+            fail_on_exceed: Override instance fail_on_exceed setting.
+
+        Returns:
+            HallMetricSnapshot of this observation.
+
+        Raises:
+            HallMetricExceededException: If hall_m >= threshold and fail_on_exceed is True.
+        """
+        snapshot = self.record(validated, rejected, operation, context)
+
+        should_fail = fail_on_exceed if fail_on_exceed is not None else self.fail_on_exceed
+
+        if should_fail and snapshot.hall_m >= self.threshold:
+            raise HallMetricExceededException(
+                hall_m=snapshot.hall_m,
+                threshold=self.threshold,
+                validated=validated,
+                rejected=rejected,
+                context=context,
+            )
+
+        return snapshot
+
+    def check_cumulative(self, fail_on_exceed: Optional[bool] = None) -> bool:
+        """Check cumulative Hall_m against threshold.
+
+        Args:
+            fail_on_exceed: Override instance fail_on_exceed setting.
+
+        Returns:
+            True if within threshold, False otherwise.
+
+        Raises:
+            HallMetricExceededException: If cumulative hall_m >= threshold and fail_on_exceed.
+        """
+        should_fail = fail_on_exceed if fail_on_exceed is not None else self.fail_on_exceed
+
+        if should_fail and self.is_exceeding_threshold:
+            raise HallMetricExceededException(
+                hall_m=self.current_hall_m,
+                threshold=self.threshold,
+                validated=self.total_validated,
+                rejected=self.total_rejected,
+                context="cumulative",
+            )
+
+        return self.is_within_threshold
+
+    def _log_metric(self, snapshot: HallMetricSnapshot) -> None:
+        """Log a metric snapshot."""
+        status = "✓" if snapshot.hall_m < self.threshold else "✗"
+        logger.info(
+            f"Hall_m [{status}] {snapshot.operation}: {snapshot.hall_m:.4f} "
+            f"(validated={snapshot.validated}, rejected={snapshot.rejected}, "
+            f"total={snapshot.total_attempted})"
+            f"{f' [{snapshot.context}]' if snapshot.context else ''}"
+        )
+
+    def _log_threshold_exceeded(self, snapshot: HallMetricSnapshot) -> None:
+        """Log warning when threshold is exceeded."""
+        logger.warning(
+            f"Hall_m EXCEEDED: {snapshot.hall_m:.4f} >= {self.threshold:.4f} "
+            f"in {snapshot.operation}"
+            f"{f' [{snapshot.context}]' if snapshot.context else ''}"
+        )
+
+    def get_summary(self) -> dict:
+        """Get summary of all metrics.
+
+        Returns:
+            Dictionary with summary statistics.
+        """
+        if not self.history:
+            return {
+                "session_start": self.session_start.isoformat(),
+                "observations": 0,
+                "cumulative_hall_m": 0.0,
+                "is_within_threshold": True,
+                "threshold": self.threshold,
+            }
+
+        hall_m_values = [s.hall_m for s in self.history]
+        operations = {}
+        for s in self.history:
+            if s.operation not in operations:
+                operations[s.operation] = {"count": 0, "validated": 0, "rejected": 0}
+            operations[s.operation]["count"] += 1
+            operations[s.operation]["validated"] += s.validated
+            operations[s.operation]["rejected"] += s.rejected
+
+        # Calculate per-operation Hall_m
+        for op_name, op_stats in operations.items():
+            total = op_stats["validated"] + op_stats["rejected"]
+            op_stats["hall_m"] = op_stats["rejected"] / total if total > 0 else 0.0
+
+        return {
+            "session_start": self.session_start.isoformat(),
+            "observations": len(self.history),
+            "cumulative_hall_m": self.current_hall_m,
+            "is_within_threshold": self.is_within_threshold,
+            "threshold": self.threshold,
+            "total_validated": self.total_validated,
+            "total_rejected": self.total_rejected,
+            "total_attempted": self.total_attempted,
+            "min_hall_m": min(hall_m_values),
+            "max_hall_m": max(hall_m_values),
+            "avg_hall_m": sum(hall_m_values) / len(hall_m_values),
+            "by_operation": operations,
+        }
+
+    def log_summary(self) -> None:
+        """Log a summary of all metrics."""
+        summary = self.get_summary()
+        status = "PASS" if summary["is_within_threshold"] else "FAIL"
+
+        logger.info(
+            f"Hall_m Summary [{status}]: "
+            f"cumulative={summary['cumulative_hall_m']:.4f}, "
+            f"threshold={summary['threshold']:.4f}, "
+            f"observations={summary['observations']}, "
+            f"validated={summary['total_validated']}, "
+            f"rejected={summary['total_rejected']}"
+        )
+
+        # Log per-operation breakdown if there are multiple operations
+        if summary.get("by_operation") and len(summary["by_operation"]) > 1:
+            for op_name, op_stats in summary["by_operation"].items():
+                logger.info(
+                    f"  - {op_name}: Hall_m={op_stats['hall_m']:.4f}, "
+                    f"validated={op_stats['validated']}, rejected={op_stats['rejected']}"
+                )
+
+    def reset(self) -> None:
+        """Reset all metrics and history."""
+        self.total_validated = 0
+        self.total_rejected = 0
+        self.history.clear()
+        self.session_start = datetime.now()
+
+    def export_history(self) -> list[dict]:
+        """Export history as list of dicts for serialization."""
+        return [s.to_dict() for s in self.history]
+
+
+# Global Hall_m tracker instance for convenience
+_global_hall_metric: Optional[HallMetric] = None
+
+
+def get_hall_metric() -> HallMetric:
+    """Get or create the global Hall_m metric tracker.
+
+    Returns:
+        Global HallMetric instance.
+    """
+    global _global_hall_metric
+    if _global_hall_metric is None:
+        _global_hall_metric = HallMetric()
+    return _global_hall_metric
+
+
+def reset_hall_metric() -> None:
+    """Reset the global Hall_m metric tracker."""
+    global _global_hall_metric
+    if _global_hall_metric is not None:
+        _global_hall_metric.reset()
+
+
+def set_hall_metric_threshold(threshold: float, fail_on_exceed: bool = False) -> None:
+    """Configure the global Hall_m metric tracker.
+
+    Args:
+        threshold: Hall_m threshold (default 0.02).
+        fail_on_exceed: Whether to raise exception when exceeded.
+    """
+    metric = get_hall_metric()
+    metric.threshold = threshold
+    metric.fail_on_exceed = fail_on_exceed
 
 
 # =========================================================================
@@ -738,6 +1134,11 @@ class DirectDependencyRetriever:
     - Tree-sitter for multi-language validation
     - LSP for cross-file references (when enabled)
     - File content fallback for basic verification
+
+    Hall_m Metric Tracking (Phase 5.3):
+    - Automatic Hall_m logging per retrieval
+    - Configurable threshold with fail-fast option
+    - Metric history for analysis
     """
 
     def __init__(
@@ -746,6 +1147,9 @@ class DirectDependencyRetriever:
         repo_path: Optional[Path] = None,
         use_multi_source: bool = True,
         use_lsp: bool = False,
+        hall_metric: Optional[HallMetric] = None,
+        fail_on_hall_m_exceed: bool = False,
+        hall_m_threshold: float = 0.02,
     ):
         """Initialize the DDR retriever.
 
@@ -754,6 +1158,9 @@ class DirectDependencyRetriever:
             repo_path: Path to the actual repository for file access.
             use_multi_source: Enable multi-source validation (AST + tree-sitter).
             use_lsp: Enable LSP validation (slower but richer type info).
+            hall_metric: Optional HallMetric instance for tracking. If None, creates new one.
+            fail_on_hall_m_exceed: Whether to raise HallMetricExceededException when Hall_m >= threshold.
+            hall_m_threshold: Hall_m threshold (default 0.02).
         """
         self.codewiki_path = codewiki_path
         self.repo_path = repo_path
@@ -769,6 +1176,13 @@ class DirectDependencyRetriever:
                 use_lsp=use_lsp,
                 lsp_project_path=repo_path,
             )
+
+        # Hall_m metric tracking (Phase 5.3)
+        self._hall_metric = hall_metric or HallMetric(
+            threshold=hall_m_threshold,
+            fail_on_exceed=fail_on_hall_m_exceed,
+        )
+        self._fail_on_hall_m_exceed = fail_on_hall_m_exceed
 
         # Validation statistics
         self._validation_stats = {
@@ -919,15 +1333,24 @@ class DirectDependencyRetriever:
 
         return index
 
-    def retrieve(self, query: str, max_results: int = 20) -> DDRResult:
+    def retrieve(
+        self,
+        query: str,
+        max_results: int = 20,
+        fail_on_exceed: Optional[bool] = None,
+    ) -> DDRResult:
         """Retrieve validated code elements matching query.
 
         Args:
             query: Search query (symbol name, concept, etc.)
             max_results: Maximum elements to return
+            fail_on_exceed: Override fail_on_hall_m_exceed setting for this query.
 
         Returns:
             DDRResult with validated elements only
+
+        Raises:
+            HallMetricExceededException: If Hall_m >= threshold and fail_on_exceed is True.
         """
         if not self._loaded and self.codewiki_path:
             catalog = self.codewiki_path / "symbol_catalog.md"
@@ -953,6 +1376,16 @@ class DirectDependencyRetriever:
         # Calculate hallucination rate
         total_attempted = len(validated_elements) + rejected_count
         hallucination_rate = rejected_count / total_attempted if total_attempted > 0 else 0.0
+
+        # Log Hall_m metric (Phase 5.3)
+        should_fail = fail_on_exceed if fail_on_exceed is not None else self._fail_on_hall_m_exceed
+        self._hall_metric.record_and_check(
+            validated=len(validated_elements),
+            rejected=rejected_count,
+            operation="retrieve",
+            context=query[:100],
+            fail_on_exceed=should_fail,
+        )
 
         return DDRResult(
             query=query,
@@ -1326,6 +1759,45 @@ class DirectDependencyRetriever:
             "target_hall_m": 0.02,
         }
 
+    @property
+    def hall_metric(self) -> HallMetric:
+        """Get the Hall_m metric tracker instance.
+
+        Returns:
+            HallMetric instance used by this retriever.
+        """
+        return self._hall_metric
+
+    def get_hall_m_summary(self) -> dict:
+        """Get summary of all Hall_m metrics from this retriever.
+
+        Returns:
+            Dictionary with summary statistics.
+        """
+        return self._hall_metric.get_summary()
+
+    def log_hall_m_summary(self) -> None:
+        """Log a summary of all Hall_m metrics."""
+        self._hall_metric.log_summary()
+
+    def reset_hall_m_metrics(self) -> None:
+        """Reset Hall_m tracking metrics (for new session)."""
+        self._hall_metric.reset()
+
+    def check_hall_m_threshold(self, fail_on_exceed: bool = True) -> bool:
+        """Check if cumulative Hall_m is within threshold.
+
+        Args:
+            fail_on_exceed: Whether to raise exception if threshold exceeded.
+
+        Returns:
+            True if within threshold, False otherwise.
+
+        Raises:
+            HallMetricExceededException: If Hall_m >= threshold and fail_on_exceed is True.
+        """
+        return self._hall_metric.check_cumulative(fail_on_exceed=fail_on_exceed)
+
     # =========================================================================
     # BATCH PROCESSING METHODS
     # =========================================================================
@@ -1336,6 +1808,7 @@ class DirectDependencyRetriever:
         max_results_per_query: int = 20,
         on_progress: Optional[Callable[[BatchProgress], None]] = None,
         max_workers: int = 4,
+        fail_on_exceed: Optional[bool] = None,
     ) -> BatchResult:
         """Retrieve validated code elements for multiple queries in batch.
 
@@ -1347,9 +1820,14 @@ class DirectDependencyRetriever:
             max_results_per_query: Max elements per query (None = unlimited)
             on_progress: Optional callback for progress updates
             max_workers: Number of parallel workers for validation
+            fail_on_exceed: Override fail_on_hall_m_exceed setting for this batch.
+                If True, raises HallMetricExceededException if Hall_m >= threshold.
 
         Returns:
             BatchResult with all validated elements and metrics
+
+        Raises:
+            HallMetricExceededException: If Hall_m >= threshold and fail_on_exceed is True.
         """
         start_time = time.time()
         progress = BatchProgress(total=len(queries))
@@ -1361,8 +1839,9 @@ class DirectDependencyRetriever:
         total_rejected = 0
 
         # Process queries - can be parallelized for large batches
+        # Note: We disable per-query fail_on_exceed and check at end of batch
         for i, query in enumerate(queries):
-            result = self.retrieve(query, max_results_per_query)
+            result = self.retrieve(query, max_results_per_query, fail_on_exceed=False)
             results.append(result)
 
             total_validated += result.validated_count
@@ -1391,12 +1870,25 @@ class DirectDependencyRetriever:
         overall_hall_rate = total_rejected / total_attempted if total_attempted > 0 else 0.0
         duration = time.time() - start_time
 
+        # Log Hall_m batch summary (Phase 5.3)
+        batch_status = "PASS" if overall_hall_rate < self._hall_metric.threshold else "FAIL"
         logger.info(
-            f"Batch complete: {len(queries)} queries, "
+            f"Batch Hall_m Summary [{batch_status}]: {len(queries)} queries, "
             f"{total_validated} validated, {total_rejected} rejected, "
-            f"Hall_m: {overall_hall_rate:.4f}, "
+            f"Hall_m: {overall_hall_rate:.4f} (threshold: {self._hall_metric.threshold:.4f}), "
             f"Duration: {duration:.2f}s"
         )
+
+        # Check if Hall_m exceeded threshold (Phase 5.3)
+        should_fail = fail_on_exceed if fail_on_exceed is not None else self._fail_on_hall_m_exceed
+        if should_fail and overall_hall_rate >= self._hall_metric.threshold:
+            raise HallMetricExceededException(
+                hall_m=overall_hall_rate,
+                threshold=self._hall_metric.threshold,
+                validated=total_validated,
+                rejected=total_rejected,
+                context=f"batch ({len(queries)} queries)",
+            )
 
         return BatchResult(
             results=results,
@@ -1413,6 +1905,7 @@ class DirectDependencyRetriever:
         max_results_per_query: int = 20,
         on_progress: Optional[Callable[[BatchProgress], None]] = None,
         max_workers: int = 4,
+        fail_on_exceed: Optional[bool] = None,
     ) -> BatchResult:
         """Retrieve validated elements in parallel for efficiency.
 
@@ -1424,9 +1917,14 @@ class DirectDependencyRetriever:
             max_results_per_query: Max elements per query
             on_progress: Optional callback for progress updates
             max_workers: Number of parallel workers
+            fail_on_exceed: Override fail_on_hall_m_exceed setting for this batch.
+                If True, raises HallMetricExceededException if Hall_m >= threshold.
 
         Returns:
             BatchResult with all validated elements
+
+        Raises:
+            HallMetricExceededException: If Hall_m >= threshold and fail_on_exceed is True.
         """
         start_time = time.time()
         progress = BatchProgress(total=len(queries))
@@ -1441,9 +1939,9 @@ class DirectDependencyRetriever:
         total_rejected = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all queries
+            # Submit all queries - disable per-query fail_on_exceed
             future_to_query = {
-                executor.submit(self.retrieve, query, max_results_per_query): query
+                executor.submit(self.retrieve, query, max_results_per_query, False): query
                 for query in queries
             }
 
@@ -1481,10 +1979,25 @@ class DirectDependencyRetriever:
         overall_hall_rate = total_rejected / total_attempted if total_attempted > 0 else 0.0
         duration = time.time() - start_time
 
+        # Log Hall_m batch summary (Phase 5.3)
+        batch_status = "PASS" if overall_hall_rate < self._hall_metric.threshold else "FAIL"
         logger.info(
-            f"Parallel batch complete: {len(queries)} queries in {duration:.2f}s "
-            f"({len(queries)/duration:.1f} queries/sec)"
+            f"Parallel Batch Hall_m Summary [{batch_status}]: {len(queries)} queries, "
+            f"{total_validated} validated, {total_rejected} rejected, "
+            f"Hall_m: {overall_hall_rate:.4f} (threshold: {self._hall_metric.threshold:.4f}), "
+            f"Duration: {duration:.2f}s ({len(queries)/max(duration, 0.001):.1f} queries/sec)"
         )
+
+        # Check if Hall_m exceeded threshold (Phase 5.3)
+        should_fail = fail_on_exceed if fail_on_exceed is not None else self._fail_on_hall_m_exceed
+        if should_fail and overall_hall_rate >= self._hall_metric.threshold:
+            raise HallMetricExceededException(
+                hall_m=overall_hall_rate,
+                threshold=self._hall_metric.threshold,
+                validated=total_validated,
+                rejected=total_rejected,
+                context=f"parallel batch ({len(queries)} queries)",
+            )
 
         return BatchResult(
             results=results,
