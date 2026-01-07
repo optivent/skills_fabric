@@ -36,6 +36,12 @@ from skills_fabric.analyze.tree_sitter import (
     TreeSitterParser,
     TSSymbol,
 )
+from skills_fabric.analyze.lsp_client import (
+    LSPClient,
+    Location,
+    HoverInfo,
+    LSPSymbol,
+)
 
 __all__ = [
     # AST Parser
@@ -48,4 +54,9 @@ __all__ = [
     # Tree-sitter Parser
     "TreeSitterParser",
     "TSSymbol",
+    # LSP Client
+    "LSPClient",
+    "Location",
+    "HoverInfo",
+    "LSPSymbol",
 ]

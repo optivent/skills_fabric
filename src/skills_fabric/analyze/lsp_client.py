@@ -34,10 +34,114 @@ class HoverInfo:
 
 @dataclass
 class Location:
-    """A location in source code."""
+    """A location in source code.
+
+    Represents a position in a file with file:line:column coordinates.
+    Uses 0-indexed positions per LSP specification.
+    """
     file: str
     line: int
     column: int
+    end_line: Optional[int] = None
+    end_column: Optional[int] = None
+
+    def __str__(self) -> str:
+        """Format as file:line for citations.
+
+        Returns:
+            String in format "file:line" or "file:line:column"
+        """
+        return f"{self.file}:{self.line + 1}"  # Convert to 1-indexed for display
+
+    def to_citation(self) -> str:
+        """Format as file:line citation for documentation.
+
+        Returns:
+            String in format "file:line" (1-indexed for human readability)
+        """
+        return f"{self.file}:{self.line + 1}"
+
+    def to_full_citation(self) -> str:
+        """Format as file:line:column citation.
+
+        Returns:
+            String in format "file:line:column" (1-indexed for human readability)
+        """
+        return f"{self.file}:{self.line + 1}:{self.column + 1}"
+
+    @classmethod
+    def from_lsp_location(cls, lsp_loc: dict) -> Optional["Location"]:
+        """Create Location from LSP Location format.
+
+        LSP Location format:
+            {
+                "uri": "file:///path/to/file.py",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 10}
+                }
+            }
+
+        Args:
+            lsp_loc: Dictionary in LSP Location format
+
+        Returns:
+            Location object or None if parsing fails
+        """
+        try:
+            uri = lsp_loc.get("uri", "")
+            file_path = uri.replace("file://", "")
+
+            range_info = lsp_loc.get("range", {})
+            start = range_info.get("start", {})
+            end = range_info.get("end", {})
+
+            return cls(
+                file=file_path,
+                line=start.get("line", 0),
+                column=start.get("character", 0),
+                end_line=end.get("line") if end else None,
+                end_column=end.get("character") if end else None
+            )
+        except Exception:
+            return None
+
+    @classmethod
+    def from_lsp_location_link(cls, lsp_link: dict) -> Optional["Location"]:
+        """Create Location from LSP LocationLink format.
+
+        LSP LocationLink format (LSP 3.14+):
+            {
+                "originSelectionRange": {...},  # optional
+                "targetUri": "file:///path/to/file.py",
+                "targetRange": {"start": {...}, "end": {...}},
+                "targetSelectionRange": {"start": {...}, "end": {...}}
+            }
+
+        Args:
+            lsp_link: Dictionary in LSP LocationLink format
+
+        Returns:
+            Location object or None if parsing fails
+        """
+        try:
+            uri = lsp_link.get("targetUri", "")
+            file_path = uri.replace("file://", "")
+
+            # Use targetSelectionRange for precise location, fallback to targetRange
+            range_info = lsp_link.get("targetSelectionRange") or lsp_link.get("targetRange", {})
+            start = range_info.get("start", {})
+            end = range_info.get("end", {})
+
+            return cls(
+                file=file_path,
+                line=start.get("line", 0),
+                column=start.get("character", 0),
+                end_line=end.get("line") if end else None,
+                end_column=end.get("character") if end else None
+            )
+        except Exception:
+            return None
 
 
 @dataclass
@@ -348,7 +452,90 @@ class LSPClient:
                 break
 
         logger.debug("LSP server stopped")
-    
+
+    def open_document(self, file: Path) -> bool:
+        """Notify the LSP server that a document is opened.
+
+        Many LSP servers require documents to be opened before making
+        requests about positions within them (hover, definition, etc.).
+
+        The document content is read from the file.
+
+        Args:
+            file: Path to the file to open
+
+        Returns:
+            True if notification was sent successfully
+        """
+        try:
+            file_path = Path(file)
+            if not file_path.exists():
+                logger.warning(f"Cannot open non-existent file: {file}")
+                return False
+
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+
+            # Determine language ID from file extension
+            suffix = file_path.suffix.lower()
+            language_id_map = {
+                ".py": "python",
+                ".ts": "typescript",
+                ".tsx": "typescriptreact",
+                ".js": "javascript",
+                ".jsx": "javascriptreact",
+                ".rs": "rust",
+                ".go": "go",
+                ".java": "java",
+                ".c": "c",
+                ".cpp": "cpp",
+                ".h": "c",
+                ".hpp": "cpp",
+            }
+            language_id = language_id_map.get(suffix, "plaintext")
+
+            self._send_notification("textDocument/didOpen", {
+                "textDocument": {
+                    "uri": f"file://{file_path.absolute()}",
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": content
+                }
+            })
+
+            logger.debug(f"Opened document: {file}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error opening document {file}: {e}")
+            return False
+
+    def close_document(self, file: Path) -> bool:
+        """Notify the LSP server that a document is closed.
+
+        This should be called when done working with a document to
+        free up resources in the LSP server.
+
+        Args:
+            file: Path to the file to close
+
+        Returns:
+            True if notification was sent successfully
+        """
+        try:
+            file_path = Path(file)
+            self._send_notification("textDocument/didClose", {
+                "textDocument": {
+                    "uri": f"file://{file_path.absolute()}"
+                }
+            })
+
+            logger.debug(f"Closed document: {file}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error closing document {file}: {e}")
+            return False
+
     def get_hover(self, file: Path, line: int, col: int) -> Optional[HoverInfo]:
         """Get hover information at position.
         
@@ -392,69 +579,199 @@ class LSPClient:
     
     def get_definition(self, file: Path, line: int, col: int) -> Optional[Location]:
         """Jump to definition.
-        
+
+        Gets the definition location for a symbol at the given position.
+        Uses 0-indexed positions per LSP specification.
+
         Args:
             file: File path
             line: Line number (0-indexed)
             col: Column number (0-indexed)
-        
+
         Returns:
-            Location of definition
+            Location of definition with file:line format, or None if not found
+        """
+        definitions = self.get_all_definitions(file, line, col)
+        return definitions[0] if definitions else None
+
+    def get_all_definitions(self, file: Path, line: int, col: int) -> list[Location]:
+        """Get all definition locations for a symbol.
+
+        LSP may return multiple definitions for:
+        - Overloaded functions
+        - Type stubs alongside implementations
+        - Multiple inheritance scenarios
+
+        Uses 0-indexed positions per LSP specification.
+
+        Args:
+            file: File path
+            line: Line number (0-indexed)
+            col: Column number (0-indexed)
+
+        Returns:
+            List of Location objects with file:line citations
         """
         result = self._send_request("textDocument/definition", {
             "textDocument": {"uri": f"file://{file}"},
             "position": {"line": line, "character": col}
         })
-        
+
         if not result:
+            return []
+
+        # Normalize to list - result can be Location, Location[], or LocationLink[]
+        if not isinstance(result, list):
+            result = [result]
+
+        locations = []
+        for item in result:
+            location = self._parse_location_or_link(item)
+            if location:
+                locations.append(location)
+
+        return locations
+
+    def find_definition(self, file: Path, line: int, col: int, auto_open: bool = True) -> Optional[str]:
+        """Find definition and return as file:line citation string.
+
+        A convenience method that returns a ready-to-use file:line citation
+        for documentation. Optionally handles document opening/closing automatically.
+
+        Args:
+            file: File path
+            line: Line number (0-indexed per LSP spec)
+            col: Column number (0-indexed per LSP spec)
+            auto_open: If True, automatically open and close the document
+
+        Returns:
+            Citation string like "path/to/file.py:42" (1-indexed for readability),
+            or None if definition not found
+
+        Example:
+            >>> client.find_definition(Path("src/main.py"), 10, 5)
+            'src/utils.py:25'
+        """
+        try:
+            if auto_open:
+                self.open_document(file)
+
+            location = self.get_definition(file, line, col)
+            if location:
+                return location.to_citation()
             return None
-        
-        # Result can be Location or Location[]
-        if isinstance(result, list):
-            result = result[0] if result else None
-        
-        if not result:
+
+        finally:
+            if auto_open:
+                self.close_document(file)
+
+    def find_all_definitions(
+        self, file: Path, line: int, col: int, auto_open: bool = True
+    ) -> list[str]:
+        """Find all definitions and return as file:line citation strings.
+
+        A convenience method that returns ready-to-use file:line citations
+        for documentation. Useful when a symbol has multiple definitions
+        (overloads, type stubs, etc.).
+
+        Args:
+            file: File path
+            line: Line number (0-indexed per LSP spec)
+            col: Column number (0-indexed per LSP spec)
+            auto_open: If True, automatically open and close the document
+
+        Returns:
+            List of citation strings like ["path/to/file.py:42", "path/to/stubs.pyi:10"]
+            (1-indexed for readability)
+
+        Example:
+            >>> client.find_all_definitions(Path("src/main.py"), 10, 5)
+            ['src/utils.py:25', 'src/utils.pyi:30']
+        """
+        try:
+            if auto_open:
+                self.open_document(file)
+
+            locations = self.get_all_definitions(file, line, col)
+            return [loc.to_citation() for loc in locations]
+
+        finally:
+            if auto_open:
+                self.close_document(file)
+
+    def _parse_location_or_link(self, item: dict) -> Optional[Location]:
+        """Parse LSP Location or LocationLink to our Location type.
+
+        LSP 3.14+ supports LocationLink which has additional fields:
+        - targetUri: target file URI
+        - targetRange: full range of target
+        - targetSelectionRange: exact range of symbol name
+        - originSelectionRange: range of the originating symbol
+
+        Args:
+            item: LSP Location or LocationLink dict
+
+        Returns:
+            Location object or None if parsing failed
+        """
+        if not item:
             return None
-        
-        uri = result.get("uri", "")
-        pos = result.get("range", {}).get("start", {})
-        
+
+        # Handle LocationLink (LSP 3.14+)
+        if "targetUri" in item:
+            uri = item.get("targetUri", "")
+            # Use targetSelectionRange for precise positioning, fall back to targetRange
+            range_info = item.get("targetSelectionRange") or item.get("targetRange", {})
+        else:
+            # Standard Location
+            uri = item.get("uri", "")
+            range_info = item.get("range", {})
+
+        if not uri:
+            return None
+
+        start = range_info.get("start", {})
+        end = range_info.get("end", {})
+
         return Location(
             file=uri.replace("file://", ""),
-            line=pos.get("line", 0),
-            column=pos.get("character", 0)
+            line=start.get("line", 0),
+            column=start.get("character", 0),
+            end_line=end.get("line") if end else None,
+            end_column=end.get("character") if end else None
         )
     
     def get_references(self, file: Path, line: int, col: int) -> list[Location]:
         """Find all references to symbol.
-        
+
+        Returns all locations where the symbol at the given position is used,
+        including the definition location.
+
+        Uses 0-indexed positions per LSP specification.
+
         Args:
             file: File path
             line: Line number (0-indexed)
             col: Column number (0-indexed)
-        
+
         Returns:
-            List of locations where symbol is used
+            List of Location objects with file:line citations
         """
         result = self._send_request("textDocument/references", {
             "textDocument": {"uri": f"file://{file}"},
             "position": {"line": line, "character": col},
             "context": {"includeDeclaration": True}
         })
-        
+
         if not result or not isinstance(result, list):
             return []
-        
+
         locations = []
         for item in result:
-            uri = item.get("uri", "")
-            pos = item.get("range", {}).get("start", {})
-            locations.append(Location(
-                file=uri.replace("file://", ""),
-                line=pos.get("line", 0),
-                column=pos.get("character", 0)
-            ))
-        
+            location = self._parse_location_or_link(item)
+            if location:
+                locations.append(location)
+
         return locations
     
     def get_document_symbols(self, file: Path) -> list[LSPSymbol]:
