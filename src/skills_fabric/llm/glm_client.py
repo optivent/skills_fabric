@@ -56,12 +56,13 @@ Usage:
     print(agent.get_thinking_usage())
 """
 from dataclasses import dataclass, field
-from typing import Optional, Iterator, Any
+from typing import Optional, Iterator, Any, AsyncIterator, Union
 from enum import Enum
 import os
 import json
 import time
 import logging
+import asyncio
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -73,6 +74,103 @@ try:
 except ImportError:
     HTTPX_AVAILABLE = False
     import requests
+
+
+class StreamInterruptionType(Enum):
+    """Types of stream interruptions."""
+    NONE = "none"  # No interruption
+    TIMEOUT = "timeout"  # Stream timed out
+    CONNECTION_ERROR = "connection_error"  # Connection was lost
+    SERVER_ERROR = "server_error"  # Server sent an error
+    CLIENT_CANCELLED = "client_cancelled"  # Client cancelled the stream
+    MALFORMED_DATA = "malformed_data"  # Received invalid SSE data
+
+
+@dataclass
+class StreamChunk:
+    """A single chunk from a streaming response.
+
+    Represents one SSE event from the GLM API stream.
+    """
+    content: str = ""
+    thinking: str = ""
+    finish_reason: Optional[str] = None
+    is_final: bool = False
+    chunk_index: int = 0
+    # Token counts (may be partial during stream)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    thinking_tokens: int = 0
+    # Timing
+    latency_ms: float = 0.0
+    # Interruption handling
+    interrupted: bool = False
+    interruption_type: StreamInterruptionType = StreamInterruptionType.NONE
+    error_message: Optional[str] = None
+
+
+@dataclass
+class StreamingStats:
+    """Statistics collected during streaming.
+
+    Tracks tokens, timing, and interruptions during a streaming response.
+    """
+    total_chunks: int = 0
+    content_length: int = 0
+    thinking_length: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    thinking_tokens: int = 0
+    start_time: float = 0.0
+    first_chunk_time: float = 0.0
+    end_time: float = 0.0
+    interrupted: bool = False
+    interruption_type: StreamInterruptionType = StreamInterruptionType.NONE
+    error_message: Optional[str] = None
+
+    @property
+    def total_tokens(self) -> int:
+        """Total tokens used."""
+        return self.prompt_tokens + self.completion_tokens + self.thinking_tokens
+
+    @property
+    def time_to_first_token_ms(self) -> float:
+        """Time from start to first chunk in milliseconds."""
+        if self.first_chunk_time == 0 or self.start_time == 0:
+            return 0.0
+        return (self.first_chunk_time - self.start_time) * 1000
+
+    @property
+    def total_duration_ms(self) -> float:
+        """Total streaming duration in milliseconds."""
+        if self.end_time == 0 or self.start_time == 0:
+            return 0.0
+        return (self.end_time - self.start_time) * 1000
+
+    @property
+    def tokens_per_second(self) -> float:
+        """Tokens generated per second."""
+        duration_s = self.total_duration_ms / 1000
+        if duration_s <= 0:
+            return 0.0
+        return self.completion_tokens / duration_s
+
+    def to_dict(self) -> dict:
+        """Convert stats to dictionary for logging."""
+        return {
+            "total_chunks": self.total_chunks,
+            "content_length": self.content_length,
+            "thinking_length": self.thinking_length,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "thinking_tokens": self.thinking_tokens,
+            "total_tokens": self.total_tokens,
+            "time_to_first_token_ms": round(self.time_to_first_token_ms, 2),
+            "total_duration_ms": round(self.total_duration_ms, 2),
+            "tokens_per_second": round(self.tokens_per_second, 2),
+            "interrupted": self.interrupted,
+            "interruption_type": self.interruption_type.value if self.interrupted else None,
+        }
 
 
 class ThinkingMode(Enum):
