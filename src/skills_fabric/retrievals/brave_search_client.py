@@ -8,7 +8,9 @@ Features:
 - News search endpoint
 - Academic/technical source filtering
 - Rate limiting with exponential backoff
-- Relevance scoring for results
+- Enhanced relevance scoring (query matching, domain authority, freshness)
+- Full metadata extraction (snippets, dates, source info)
+- Academic and guideline search filtering
 - Max 20 results per query (API limit)
 
 IMPORTANT: Uses X-Subscription-Token header (NOT Authorization).
@@ -35,6 +37,21 @@ Usage:
     # Academic/technical sources
     results = await client.search_technical("LangGraph documentation")
 
+    # Academic sources (arxiv, papers, research)
+    results = await client.search_academic("transformer architecture")
+
+    # Clinical guidelines (medical)
+    results = await client.search_guidelines("diabetes treatment", country="USA")
+
+    # Enhanced relevance scoring
+    scorer = RelevanceScorer()
+    score = scorer.calculate_relevance(
+        result=result,
+        query="LangGraph tutorial",
+        position=0,
+        total_results=10
+    )
+
     # Synchronous interface
     results = client.search_sync("Python dataclasses")
 
@@ -45,11 +62,14 @@ from __future__ import annotations
 import os
 import asyncio
 import random
+import re
 import time
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional, Any
 from enum import Enum
+from urllib.parse import urlparse
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -97,13 +117,366 @@ class ResultSource(Enum):
     NEWS = "brave_news"
     IMAGES = "brave_images"
     ACADEMIC = "brave_academic"
+    GUIDELINE = "brave_guideline"
+
+
+class ContentType(Enum):
+    """Detected content type for search results."""
+    DOCUMENTATION = "documentation"
+    TUTORIAL = "tutorial"
+    API_REFERENCE = "api_reference"
+    BLOG_POST = "blog_post"
+    NEWS_ARTICLE = "news_article"
+    ACADEMIC_PAPER = "academic_paper"
+    GUIDELINE = "guideline"
+    FORUM_POST = "forum_post"
+    VIDEO = "video"
+    REPOSITORY = "repository"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class DomainAuthority:
+    """Domain authority and trust scoring.
+
+    Provides trust scores for known domains used in relevance calculation.
+    """
+    domain: str
+    category: str  # "technical", "academic", "official", "news", "general"
+    trust_score: float  # 0.0-1.0
+    is_primary_source: bool = False  # Official docs, original sources
+
+    # Known high-authority domains for technical content
+    AUTHORITY_SCORES: dict[str, tuple[str, float, bool]] = {
+        # Official documentation (highest trust)
+        "docs.python.org": ("official", 0.98, True),
+        "langchain.com": ("official", 0.95, True),
+        "python.langchain.com": ("official", 0.95, True),
+        "api.python.langchain.com": ("official", 0.96, True),
+        "docs.anthropic.com": ("official", 0.98, True),
+        "openai.com": ("official", 0.95, True),
+        "react.dev": ("official", 0.97, True),
+        "fastapi.tiangolo.com": ("official", 0.95, True),
+        "pydantic.dev": ("official", 0.95, True),
+        "pydantic-docs.helpmanual.io": ("official", 0.94, True),
+
+        # Code repositories (very high trust for code)
+        "github.com": ("technical", 0.92, True),
+        "gitlab.com": ("technical", 0.88, True),
+        "bitbucket.org": ("technical", 0.85, False),
+
+        # Academic sources (high trust)
+        "arxiv.org": ("academic", 0.94, True),
+        "scholar.google.com": ("academic", 0.85, False),
+        "pubmed.ncbi.nlm.nih.gov": ("academic", 0.96, True),
+        "nih.gov": ("academic", 0.95, True),
+        "nature.com": ("academic", 0.93, True),
+        "sciencedirect.com": ("academic", 0.90, False),
+        "ieee.org": ("academic", 0.92, True),
+        "acm.org": ("academic", 0.91, True),
+
+        # Technical community (medium-high trust)
+        "stackoverflow.com": ("technical", 0.82, False),
+        "readthedocs.io": ("technical", 0.88, True),
+        "readthedocs.org": ("technical", 0.88, True),
+        "dev.to": ("technical", 0.70, False),
+        "realpython.com": ("technical", 0.82, False),
+        "python.org": ("official", 0.96, True),
+        "pypi.org": ("official", 0.90, True),
+
+        # Guideline sources (medical)
+        "who.int": ("official", 0.97, True),
+        "cdc.gov": ("official", 0.96, True),
+        "fda.gov": ("official", 0.95, True),
+        "nice.org.uk": ("official", 0.94, True),
+        "aao.org": ("official", 0.93, True),
+        "cochrane.org": ("academic", 0.94, True),
+
+        # General tech media (medium trust)
+        "medium.com": ("general", 0.55, False),
+        "towardsdatascience.com": ("technical", 0.68, False),
+        "hackernews.com": ("general", 0.60, False),
+        "reddit.com": ("general", 0.45, False),
+
+        # News sources
+        "techcrunch.com": ("news", 0.72, False),
+        "wired.com": ("news", 0.70, False),
+        "arstechnica.com": ("news", 0.75, False),
+        "theverge.com": ("news", 0.65, False),
+    }
+
+    @classmethod
+    def from_url(cls, url: str) -> "DomainAuthority":
+        """Create DomainAuthority from a URL."""
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+
+            # Check exact match first
+            if domain in cls.AUTHORITY_SCORES:
+                category, score, is_primary = cls.AUTHORITY_SCORES[domain]
+                return cls(domain, category, score, is_primary)
+
+            # Check subdomain matches (e.g., docs.python.org)
+            for known_domain, (category, score, is_primary) in cls.AUTHORITY_SCORES.items():
+                if domain.endswith("." + known_domain) or domain == known_domain:
+                    return cls(domain, category, score, is_primary)
+
+            # Check if it's a known pattern
+            if ".gov" in domain:
+                return cls(domain, "official", 0.80, True)
+            elif ".edu" in domain:
+                return cls(domain, "academic", 0.75, False)
+            elif ".org" in domain:
+                return cls(domain, "general", 0.55, False)
+            elif "docs." in domain or "api." in domain or "documentation" in domain:
+                return cls(domain, "technical", 0.70, True)
+
+            # Unknown domain
+            return cls(domain, "general", 0.40, False)
+        except Exception:
+            return cls("unknown", "general", 0.30, False)
+
+
+class RelevanceScorer:
+    """Calculate relevance scores for search results.
+
+    Uses multiple signals:
+    - Position-based scoring (rank in results)
+    - Query term matching (title, description overlap)
+    - Domain authority scoring
+    - Freshness scoring (recency of content)
+    - Content type matching
+
+    Example:
+        scorer = RelevanceScorer()
+        score = scorer.calculate_relevance(
+            result=result,
+            query="LangGraph StateGraph tutorial",
+            position=0,
+            total_results=10
+        )
+    """
+
+    # Weights for different scoring components
+    POSITION_WEIGHT = 0.25
+    QUERY_MATCH_WEIGHT = 0.35
+    DOMAIN_AUTHORITY_WEIGHT = 0.25
+    FRESHNESS_WEIGHT = 0.15
+
+    def __init__(
+        self,
+        position_weight: float = POSITION_WEIGHT,
+        query_match_weight: float = QUERY_MATCH_WEIGHT,
+        domain_authority_weight: float = DOMAIN_AUTHORITY_WEIGHT,
+        freshness_weight: float = FRESHNESS_WEIGHT,
+    ):
+        """Initialize the relevance scorer.
+
+        Args:
+            position_weight: Weight for position-based score (0-1)
+            query_match_weight: Weight for query term matching (0-1)
+            domain_authority_weight: Weight for domain trust score (0-1)
+            freshness_weight: Weight for content freshness (0-1)
+        """
+        self.position_weight = position_weight
+        self.query_match_weight = query_match_weight
+        self.domain_authority_weight = domain_authority_weight
+        self.freshness_weight = freshness_weight
+
+        # Normalize weights to sum to 1.0
+        total = self.position_weight + self.query_match_weight + self.domain_authority_weight + self.freshness_weight
+        if total > 0:
+            self.position_weight /= total
+            self.query_match_weight /= total
+            self.domain_authority_weight /= total
+            self.freshness_weight /= total
+
+    def calculate_relevance(
+        self,
+        result: "SearchResult",
+        query: str,
+        position: int,
+        total_results: int,
+    ) -> float:
+        """Calculate combined relevance score for a search result.
+
+        Args:
+            result: The search result to score
+            query: Original search query
+            position: Position in search results (0-indexed)
+            total_results: Total number of results
+
+        Returns:
+            Relevance score between 0.0 and 1.0
+        """
+        # Position score: Higher rank = higher score
+        position_score = self._calculate_position_score(position, total_results)
+
+        # Query match score: How well title/description match query terms
+        query_match_score = self._calculate_query_match_score(result, query)
+
+        # Domain authority score
+        domain_auth = DomainAuthority.from_url(result.url)
+        domain_score = domain_auth.trust_score
+
+        # Freshness score (if date available)
+        freshness_score = self._calculate_freshness_score(result.date, result.metadata.get("page_age"))
+
+        # Combine with weights
+        combined_score = (
+            self.position_weight * position_score +
+            self.query_match_weight * query_match_score +
+            self.domain_authority_weight * domain_score +
+            self.freshness_weight * freshness_score
+        )
+
+        return min(1.0, max(0.0, combined_score))
+
+    def _calculate_position_score(self, position: int, total_results: int) -> float:
+        """Calculate score based on result position.
+
+        Uses exponential decay: earlier results score much higher.
+        """
+        if total_results <= 0:
+            return 0.5
+
+        # Exponential decay based on position
+        # Position 0 = 1.0, position n = e^(-0.2*n)
+        import math
+        return math.exp(-0.2 * position)
+
+    def _calculate_query_match_score(self, result: "SearchResult", query: str) -> float:
+        """Calculate score based on query term matching.
+
+        Checks how many query terms appear in title and description.
+        """
+        # Tokenize query into significant words (skip common words)
+        stopwords = {"the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for", "of", "and", "or", "with", "how", "what", "when", "where", "why"}
+        query_terms = set(
+            word.lower() for word in re.findall(r'\b\w+\b', query.lower())
+            if word.lower() not in stopwords and len(word) > 2
+        )
+
+        if not query_terms:
+            return 0.5  # Neutral score if no significant terms
+
+        # Check title and description
+        title_lower = result.title.lower()
+        desc_lower = result.description.lower()
+        combined_text = f"{title_lower} {desc_lower}"
+
+        # Count matches with position weighting (title matches worth more)
+        title_matches = sum(1 for term in query_terms if term in title_lower)
+        desc_matches = sum(1 for term in query_terms if term in desc_lower and term not in title_lower)
+
+        # Title matches weighted 2x
+        weighted_matches = (title_matches * 2) + desc_matches
+        max_possible = len(query_terms) * 2  # If all terms in title
+
+        return min(1.0, weighted_matches / max_possible) if max_possible > 0 else 0.5
+
+    def _calculate_freshness_score(self, date_str: Optional[str], page_age: Optional[str] = None) -> float:
+        """Calculate score based on content freshness.
+
+        More recent content scores higher.
+        """
+        # Default to neutral if no date info
+        if not date_str and not page_age:
+            return 0.5
+
+        # Try to parse age strings like "2 days ago", "1 week ago", etc.
+        age_text = page_age or date_str or ""
+        age_lower = age_text.lower()
+
+        # Map age to freshness score
+        if any(x in age_lower for x in ["hour", "minute", "just now"]):
+            return 1.0  # Very fresh
+        elif "day" in age_lower:
+            # Extract number of days if possible
+            match = re.search(r'(\d+)\s*day', age_lower)
+            days = int(match.group(1)) if match else 1
+            return max(0.6, 1.0 - (days * 0.05))  # Decay over days
+        elif "week" in age_lower:
+            match = re.search(r'(\d+)\s*week', age_lower)
+            weeks = int(match.group(1)) if match else 1
+            return max(0.4, 0.8 - (weeks * 0.1))
+        elif "month" in age_lower:
+            match = re.search(r'(\d+)\s*month', age_lower)
+            months = int(match.group(1)) if match else 1
+            return max(0.2, 0.6 - (months * 0.05))
+        elif "year" in age_lower:
+            match = re.search(r'(\d+)\s*year', age_lower)
+            years = int(match.group(1)) if match else 1
+            return max(0.1, 0.4 - (years * 0.1))
+
+        return 0.5  # Default neutral
+
+    def detect_content_type(self, result: "SearchResult") -> ContentType:
+        """Detect the type of content from URL and title patterns.
+
+        Args:
+            result: Search result to analyze
+
+        Returns:
+            Detected ContentType enum value
+        """
+        url_lower = result.url.lower()
+        title_lower = result.title.lower()
+        desc_lower = result.description.lower()
+        combined = f"{url_lower} {title_lower} {desc_lower}"
+
+        # Check URL patterns first
+        if "github.com" in url_lower or "gitlab.com" in url_lower:
+            return ContentType.REPOSITORY
+        elif "youtube.com" in url_lower or "vimeo.com" in url_lower:
+            return ContentType.VIDEO
+        elif "stackoverflow.com" in url_lower or "stackexchange.com" in url_lower:
+            return ContentType.FORUM_POST
+        elif "arxiv.org" in url_lower or "papers" in url_lower or "pubmed" in url_lower:
+            return ContentType.ACADEMIC_PAPER
+
+        # Check content patterns
+        if any(x in combined for x in ["guideline", "clinical practice", "treatment protocol", "recommendation"]):
+            return ContentType.GUIDELINE
+        elif any(x in combined for x in ["tutorial", "how to", "getting started", "step by step", "learn"]):
+            return ContentType.TUTORIAL
+        elif any(x in combined for x in ["api reference", "api documentation", "method reference", "class reference"]):
+            return ContentType.API_REFERENCE
+        elif any(x in combined for x in ["documentation", "docs.", "/docs/", "official guide"]):
+            return ContentType.DOCUMENTATION
+        elif result.source == ResultSource.NEWS or any(x in combined for x in ["news", "announced", "released", "launches"]):
+            return ContentType.NEWS_ARTICLE
+        elif any(x in url_lower for x in ["blog", "medium.com", "dev.to", "hashnode"]):
+            return ContentType.BLOG_POST
+
+        return ContentType.UNKNOWN
 
 
 @dataclass
 class SearchResult:
     """A search result from Brave Search API.
 
-    Contains the result metadata plus relevance scoring.
+    Contains the result metadata plus enhanced relevance scoring.
+
+    Attributes:
+        title: Result title
+        url: Full URL of the result
+        description: Snippet/description text
+        source: Source type (web, news, academic, etc.)
+        date: Age of the result (e.g., "2 days ago")
+        relevance_score: Combined relevance score 0.0-1.0
+        language: Content language code
+        family_friendly: SafeSearch flag
+        extra_snippets: Additional text snippets from page
+        metadata: Additional metadata from API
+        content_type: Detected content type (tutorial, docs, etc.)
+        domain_authority: Domain trust score info
+        position_score: Score from search position
+        query_match_score: Score from query term matching
+        freshness_score: Score from content freshness
     """
     title: str
     url: str
@@ -115,9 +488,15 @@ class SearchResult:
     family_friendly: bool = True
     extra_snippets: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Enhanced fields
+    content_type: ContentType = ContentType.UNKNOWN
+    domain_authority: Optional[DomainAuthority] = None
+    position_score: float = 0.0
+    query_match_score: float = 0.0
+    freshness_score: float = 0.0
 
     def to_dict(self) -> dict:
-        """Convert result to dictionary."""
+        """Convert result to dictionary with full metadata."""
         return {
             "title": self.title,
             "url": self.url,
@@ -129,13 +508,26 @@ class SearchResult:
             "family_friendly": self.family_friendly,
             "extra_snippets": self.extra_snippets,
             "metadata": self.metadata,
+            "domain": self.domain,
+            "content_type": self.content_type.value,
+            "domain_authority": {
+                "domain": self.domain_authority.domain,
+                "category": self.domain_authority.category,
+                "trust_score": self.domain_authority.trust_score,
+                "is_primary_source": self.domain_authority.is_primary_source,
+            } if self.domain_authority else None,
+            "score_breakdown": {
+                "position": self.position_score,
+                "query_match": self.query_match_score,
+                "freshness": self.freshness_score,
+                "domain_authority": self.domain_authority.trust_score if self.domain_authority else 0.0,
+            },
         }
 
     @property
     def domain(self) -> str:
         """Extract domain from URL."""
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(self.url)
             domain = parsed.netloc.lower()
             if domain.startswith("www."):
@@ -143,6 +535,36 @@ class SearchResult:
             return domain
         except Exception:
             return ""
+
+    @property
+    def is_primary_source(self) -> bool:
+        """Check if this is a primary/official source."""
+        return self.domain_authority.is_primary_source if self.domain_authority else False
+
+    @property
+    def trust_score(self) -> float:
+        """Get the domain trust score."""
+        return self.domain_authority.trust_score if self.domain_authority else 0.0
+
+    @property
+    def all_snippets(self) -> list[str]:
+        """Get all text snippets including description."""
+        snippets = [self.description] if self.description else []
+        snippets.extend(self.extra_snippets)
+        return snippets
+
+    @property
+    def snippet_text(self) -> str:
+        """Get all snippets as a single text."""
+        return " ".join(self.all_snippets)
+
+    def matches_content_type(self, content_type: ContentType) -> bool:
+        """Check if this result matches the specified content type."""
+        return self.content_type == content_type
+
+    def is_high_quality(self, min_relevance: float = 0.6) -> bool:
+        """Check if this is a high-quality result based on relevance and trust."""
+        return self.relevance_score >= min_relevance and self.trust_score >= 0.5
 
 
 @dataclass
@@ -450,6 +872,111 @@ class BraveSearchClient:
 
         return await self.search(query, count=count, freshness=Freshness.YEAR)
 
+    async def search_academic(
+        self,
+        query: str,
+        count: int = 20,
+        freshness: Optional[Freshness] = None,
+    ) -> BraveSearchResponse:
+        """Search for academic/research content via web search with academic filters.
+
+        Filters results to known academic and research sources:
+        - ArXiv, Nature, IEEE, ACM
+        - PubMed, NIH, Scholar
+        - University sites (.edu)
+        - Research papers and preprints
+
+        Args:
+            query: Search query
+            count: Number of results (max 20)
+            freshness: Optional time filter
+
+        Returns:
+            BraveSearchResponse with academic results
+        """
+        # Academic site filters for research content
+        academic_sites = [
+            "site:arxiv.org",
+            "site:pubmed.ncbi.nlm.nih.gov",
+            "site:nih.gov",
+            "site:nature.com",
+            "site:sciencedirect.com",
+            "site:ieee.org",
+            "site:acm.org",
+            "site:springer.com",
+            "site:scholar.google.com",
+            "site:researchgate.net",
+            "site:semanticscholar.org",
+        ]
+
+        # Build OR query for academic sites
+        site_filter = " OR ".join(academic_sites)
+        enhanced_query = f"({query}) ({site_filter})"
+
+        response = await self.search(
+            enhanced_query,
+            count=count,
+            freshness=freshness,
+        )
+
+        # Update source and content type for academic results
+        for result in response.results:
+            result.source = ResultSource.ACADEMIC
+            if result.content_type == ContentType.UNKNOWN:
+                result.content_type = ContentType.ACADEMIC_PAPER
+
+        return response
+
+    async def search_guidelines(
+        self,
+        topic: str,
+        country: Optional[str] = None,
+        count: int = 10,
+        freshness: Optional[Freshness] = Freshness.YEAR,
+    ) -> BraveSearchResponse:
+        """Search specifically for clinical practice guidelines and standards.
+
+        Optimized for finding official guidelines, treatment protocols,
+        and best practice recommendations from authoritative sources.
+
+        Args:
+            topic: Topic area (e.g., "diabetes treatment", "async programming")
+            country: Optional country filter (e.g., "USA", "UK", "EU")
+            count: Number of results
+            freshness: Time filter (defaults to past year)
+
+        Returns:
+            BraveSearchResponse with guideline results
+        """
+        # Build guideline-specific query
+        query_parts = [
+            topic,
+            "clinical practice guideline OR treatment guideline OR management guideline OR best practice OR standard of care",
+        ]
+
+        # Country-specific guideline organizations
+        country_orgs = {
+            "USA": "AAO OR AAFP OR ADA OR AMA OR site:aao.org OR site:guidelines.gov OR site:cdc.gov OR site:fda.gov",
+            "UK": "NICE OR NHS OR site:nice.org.uk OR site:nhs.uk",
+            "EU": "EMA OR ESCRS OR site:ema.europa.eu OR site:who.int",
+            "WHO": "site:who.int OR World Health Organization",
+        }
+
+        if country and country.upper() in country_orgs:
+            query_parts.append(country_orgs[country.upper()])
+
+        query = " ".join(query_parts)
+
+        response = await self.search(query, count=count, freshness=freshness)
+
+        # Update source and content type for guideline results
+        for result in response.results:
+            result.source = ResultSource.GUIDELINE
+            if result.content_type == ContentType.UNKNOWN:
+                result.content_type = ContentType.GUIDELINE
+
+        return response
+
     async def _request_with_retry(
         self,
         endpoint: str,
@@ -552,82 +1079,172 @@ class BraveSearchClient:
 
         return data
 
-    def _parse_web_response(self, query: str, data: dict) -> BraveSearchResponse:
-        """Parse web search response.
+    def _parse_web_response(
+        self,
+        query: str,
+        data: dict,
+        use_enhanced_scoring: bool = True,
+    ) -> BraveSearchResponse:
+        """Parse web search response with enhanced metadata extraction.
 
         Args:
             query: Original query
             data: Raw API response
+            use_enhanced_scoring: Whether to use multi-signal relevance scoring
 
         Returns:
-            BraveSearchResponse
+            BraveSearchResponse with parsed results
         """
         results = []
         web_results = data.get("web", {}).get("results", [])
+        total_results = len(web_results)
+
+        scorer = RelevanceScorer() if use_enhanced_scoring else None
 
         for i, item in enumerate(web_results):
-            # Calculate relevance score based on position
-            # Higher rank = higher score (position 0 = 1.0, decreasing)
-            relevance = 1.0 - (i / max(len(web_results), 1))
+            # Extract all available metadata
+            url = item.get("url", "")
+            title = item.get("title", "")
+            description = item.get("description", "")
+            extra_snippets = item.get("extra_snippets", [])
+            page_age = item.get("page_age")
+            age = item.get("age")
 
-            results.append(SearchResult(
-                title=item.get("title", ""),
-                url=item.get("url", ""),
-                description=item.get("description", ""),
+            # Get domain authority info
+            domain_auth = DomainAuthority.from_url(url)
+
+            # Create preliminary result for scoring
+            result = SearchResult(
+                title=title,
+                url=url,
+                description=description,
                 source=ResultSource.WEB,
-                date=item.get("age"),  # Brave returns "age" field
-                relevance_score=relevance,
+                date=age,
                 language=item.get("language"),
                 family_friendly=item.get("family_friendly", True),
-                extra_snippets=item.get("extra_snippets", []),
+                extra_snippets=extra_snippets,
                 metadata={
-                    "page_age": item.get("page_age"),
+                    "page_age": page_age,
                     "profile": item.get("profile", {}),
+                    "page_fetched": item.get("page_fetched"),
+                    "deep_results": item.get("deep_results", {}),
+                    "thumbnail": item.get("thumbnail", {}).get("src"),
                 },
-            ))
+                domain_authority=domain_auth,
+            )
+
+            # Calculate relevance scores
+            if scorer:
+                # Calculate individual score components
+                import math
+                position_score = math.exp(-0.2 * i)
+                query_match_score = scorer._calculate_query_match_score(result, query)
+                freshness_score = scorer._calculate_freshness_score(age, page_age)
+
+                # Calculate combined score
+                relevance = scorer.calculate_relevance(result, query, i, total_results)
+
+                # Detect content type
+                content_type = scorer.detect_content_type(result)
+
+                # Update result with scores
+                result.relevance_score = relevance
+                result.position_score = position_score
+                result.query_match_score = query_match_score
+                result.freshness_score = freshness_score
+                result.content_type = content_type
+            else:
+                # Simple position-based scoring fallback
+                result.relevance_score = 1.0 - (i / max(total_results, 1))
+
+            results.append(result)
 
         return BraveSearchResponse(
             query=query,
             results=results,
-            total_results=len(results),
+            total_results=total_results,
             latency_ms=0,  # Set by caller
             query_type="web",
             altered_query=data.get("query", {}).get("altered"),
         )
 
-    def _parse_news_response(self, query: str, data: dict) -> BraveSearchResponse:
-        """Parse news search response.
+    def _parse_news_response(
+        self,
+        query: str,
+        data: dict,
+        use_enhanced_scoring: bool = True,
+    ) -> BraveSearchResponse:
+        """Parse news search response with enhanced metadata extraction.
 
         Args:
             query: Original query
             data: Raw API response
+            use_enhanced_scoring: Whether to use multi-signal relevance scoring
 
         Returns:
             BraveSearchResponse with news results
         """
         results = []
         news_results = data.get("results", [])
+        total_results = len(news_results)
+
+        scorer = RelevanceScorer() if use_enhanced_scoring else None
 
         for i, item in enumerate(news_results):
-            relevance = 1.0 - (i / max(len(news_results), 1))
+            # Extract all available metadata
+            url = item.get("url", "")
+            title = item.get("title", "")
+            description = item.get("description", "")
+            age = item.get("age")
+            meta_url = item.get("meta_url", {})
+            thumbnail = item.get("thumbnail", {})
 
-            results.append(SearchResult(
-                title=item.get("title", ""),
-                url=item.get("url", ""),
-                description=item.get("description", ""),
+            # Get domain authority info
+            domain_auth = DomainAuthority.from_url(url)
+
+            # Create preliminary result for scoring
+            result = SearchResult(
+                title=title,
+                url=url,
+                description=description,
                 source=ResultSource.NEWS,
-                date=item.get("age"),
-                relevance_score=relevance,
+                date=age,
                 metadata={
-                    "source_name": item.get("meta_url", {}).get("hostname"),
-                    "thumbnail": item.get("thumbnail", {}).get("src"),
+                    "source_name": meta_url.get("hostname"),
+                    "source_url": meta_url.get("scheme", "https") + "://" + meta_url.get("hostname", "") if meta_url.get("hostname") else None,
+                    "thumbnail": thumbnail.get("src"),
+                    "thumbnail_height": thumbnail.get("height"),
+                    "thumbnail_width": thumbnail.get("width"),
+                    "page_age": item.get("page_age"),
                 },
-            ))
+                domain_authority=domain_auth,
+                content_type=ContentType.NEWS_ARTICLE,
+            )
+
+            # Calculate relevance scores
+            if scorer:
+                import math
+                position_score = math.exp(-0.2 * i)
+                query_match_score = scorer._calculate_query_match_score(result, query)
+                freshness_score = scorer._calculate_freshness_score(age, item.get("page_age"))
+
+                # For news, freshness is weighted higher
+                relevance = scorer.calculate_relevance(result, query, i, total_results)
+
+                # Update result with scores
+                result.relevance_score = relevance
+                result.position_score = position_score
+                result.query_match_score = query_match_score
+                result.freshness_score = freshness_score
+            else:
+                result.relevance_score = 1.0 - (i / max(total_results, 1))
+
+            results.append(result)
 
         return BraveSearchResponse(
             query=query,
             results=results,
-            total_results=len(results),
+            total_results=total_results,
             latency_ms=0,
             query_type="news",
         )
@@ -673,6 +1290,23 @@ class BraveSearchClient:
     ) -> BraveSearchResponse:
         """Synchronous wrapper for search_documentation()."""
         return asyncio.run(self.search_documentation(library_name, topic, **kwargs))
+
+    def search_academic_sync(
+        self,
+        query: str,
+        **kwargs,
+    ) -> BraveSearchResponse:
+        """Synchronous wrapper for search_academic()."""
+        return asyncio.run(self.search_academic(query, **kwargs))
+
+    def search_guidelines_sync(
+        self,
+        topic: str,
+        country: Optional[str] = None,
+        **kwargs,
+    ) -> BraveSearchResponse:
+        """Synchronous wrapper for search_guidelines()."""
+        return asyncio.run(self.search_guidelines(topic, country, **kwargs))
 
     def get_stats(self) -> dict:
         """Get client statistics."""
@@ -755,6 +1389,13 @@ EXAMPLES:
   # Technical/documentation search
   python -m skills_fabric.retrievals.brave_search_client -q "FastAPI tutorial" --technical
 
+  # Academic/scholarly search
+  python -m skills_fabric.retrievals.brave_search_client -q "transformer architecture" --academic
+
+  # Guidelines search (software or medical domain)
+  python -m skills_fabric.retrievals.brave_search_client -q "REST API design" --guidelines --domain software
+  python -m skills_fabric.retrievals.brave_search_client -q "diabetes treatment" --guidelines --domain medical --country USA
+
   # Output as JSON
   python -m skills_fabric.retrievals.brave_search_client -q "REST API" --json
 
@@ -776,6 +1417,11 @@ NOTE:
     parser.add_argument("--count", "-n", type=int, default=10, help="Number of results (max 20)")
     parser.add_argument("--news", action="store_true", help="Search news instead of web")
     parser.add_argument("--technical", action="store_true", help="Filter to technical sources")
+    parser.add_argument("--academic", action="store_true", help="Filter to academic/scholarly sources")
+    parser.add_argument("--guidelines", action="store_true", help="Search for guidelines and best practices")
+    parser.add_argument("--domain", choices=["software", "medical", "security", "devops", "data_science"],
+                       default="software", help="Domain for guidelines search (default: software)")
+    parser.add_argument("--country", help="Country filter for medical guidelines (USA, UK, EU)")
     parser.add_argument("--freshness", choices=["pd", "pw", "pm", "py"],
                        help="Time filter: pd=day, pw=week, pm=month, py=year")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
@@ -799,7 +1445,14 @@ NOTE:
     async def run() -> None:
         client = BraveSearchClient()
 
-        if args.technical:
+        if args.guidelines:
+            response = await client.search_guidelines(
+                args.query, domain=args.domain, country=args.country,
+                count=args.count, freshness=freshness
+            )
+        elif args.academic:
+            response = await client.search_academic(args.query, count=args.count, freshness=freshness)
+        elif args.technical:
             response = await client.search_technical(args.query, count=args.count, freshness=freshness)
         elif args.news:
             response = await client.search_news(args.query, count=args.count, freshness=freshness)

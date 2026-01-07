@@ -42,6 +42,10 @@ from .brave_search_client import (
     Freshness,
     SafeSearch,
     ResultSource,
+    # Enhanced result parsing
+    ContentType,
+    DomainAuthority,
+    RelevanceScorer,
 )
 
 __all__ = [
@@ -72,4 +76,8 @@ __all__ = [
     "Freshness",
     "SafeSearch",
     "ResultSource",
+    # Enhanced result parsing
+    "ContentType",
+    "DomainAuthority",
+    "RelevanceScorer",
 ]
