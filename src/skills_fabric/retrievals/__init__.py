@@ -7,7 +7,9 @@ Provides research and search APIs for:
 Features:
 - Citation extraction and validation
 - Rate limiting with exponential backoff
-- Research loop pattern for iterative refinement
+- Iterative research loop with query refinement
+- Multiple refinement strategies (RELATED, REFINE, VALIDATE, COMPREHENSIVE, CITATIONS)
+- Research depth and convergence tracking
 - Related questions for follow-up research
 """
 from .perplexity_client import (
@@ -21,6 +23,12 @@ from .perplexity_client import (
     ResearchFinding,
     ResearchResult,
     TokenUsage,
+    # New iterative research types
+    RefinementStrategy,
+    ResearchStopReason,
+    CitationValidation,
+    ResearchMetrics,
+    RefinedQuery,
 )
 
 __all__ = [
@@ -31,10 +39,16 @@ __all__ = [
     # Models
     "SonarModel",
     "SearchDomain",
+    # Research strategies and tracking
+    "RefinementStrategy",
+    "ResearchStopReason",
     # Data classes
     "Citation",
+    "CitationValidation",
     "RelatedQuestion",
     "ResearchFinding",
     "ResearchResult",
+    "ResearchMetrics",
+    "RefinedQuery",
     "TokenUsage",
 ]
