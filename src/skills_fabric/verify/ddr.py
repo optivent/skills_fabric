@@ -17,8 +17,15 @@ Batch Processing:
 - Processes ALL concepts without artificial limits
 - Tracks progress for large batches
 - Supports async batch validation for efficiency
+
+Multi-Source Validation (Phase 5.2):
+- AST parser for Python files (rich metadata)
+- Tree-sitter for multi-language validation (Python, TypeScript, JavaScript)
+- LSP for cross-file references when available
+- Cross-checks symbols across multiple sources for higher confidence
 """
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +36,556 @@ import time
 from ..observability.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# =========================================================================
+# MULTI-SOURCE VALIDATION TYPES (Phase 5.2)
+# =========================================================================
+
+
+class ValidationSource(Enum):
+    """Sources used for symbol validation."""
+    SYMBOL_CATALOG = "symbol_catalog"  # From CodeWiki symbol_catalog.md
+    AST_PARSER = "ast_parser"          # Python AST parsing
+    TREE_SITTER = "tree_sitter"        # Tree-sitter multi-language parsing
+    LSP = "lsp"                        # Language Server Protocol
+    FILE_CONTENT = "file_content"      # Direct file content verification
+    CODEWIKI_SECTIONS = "codewiki_sections"  # CodeWiki extracted sections
+
+
+@dataclass
+class ValidationResult:
+    """Result from multi-source symbol validation.
+
+    Tracks which sources validated the symbol and any discrepancies.
+    Higher confidence when multiple sources agree.
+    """
+    symbol_name: str
+    is_valid: bool
+    sources_checked: list[ValidationSource] = field(default_factory=list)
+    sources_confirmed: list[ValidationSource] = field(default_factory=list)
+    line_number: int = 0
+    actual_line: Optional[int] = None  # Line from validation (may differ)
+    symbol_kind: Optional[str] = None
+    signature: Optional[str] = None
+    docstring: Optional[str] = None
+    discrepancies: list[str] = field(default_factory=list)
+
+    @property
+    def confidence(self) -> float:
+        """Confidence score based on number of confirming sources.
+
+        Returns:
+            Float between 0.0 and 1.0. Higher when more sources confirm.
+        """
+        if not self.sources_checked:
+            return 0.0
+        return len(self.sources_confirmed) / len(self.sources_checked)
+
+    @property
+    def is_high_confidence(self) -> bool:
+        """Check if validation is high confidence (>= 2 sources agree).
+
+        Returns:
+            True if at least 2 validation sources confirmed the symbol.
+        """
+        return len(self.sources_confirmed) >= 2
+
+    @property
+    def has_discrepancies(self) -> bool:
+        """Check if there are any discrepancies between sources.
+
+        Returns:
+            True if any discrepancies were found during validation.
+        """
+        return len(self.discrepancies) > 0
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization."""
+        return {
+            "symbol_name": self.symbol_name,
+            "is_valid": self.is_valid,
+            "confidence": self.confidence,
+            "sources_checked": [s.value for s in self.sources_checked],
+            "sources_confirmed": [s.value for s in self.sources_confirmed],
+            "line_number": self.line_number,
+            "actual_line": self.actual_line,
+            "symbol_kind": self.symbol_kind,
+            "signature": self.signature,
+            "discrepancies": self.discrepancies,
+        }
+
+
+class MultiSourceValidator:
+    """Multi-source symbol validation using AST, Tree-sitter, and LSP.
+
+    Validates symbols exist in actual source files by cross-checking:
+    1. Python AST parser for rich metadata (Python files)
+    2. Tree-sitter for multi-language support (Python, TypeScript, JavaScript)
+    3. LSP for type information and cross-file references (when available)
+    4. Direct file content verification as fallback
+
+    Higher confidence when multiple sources confirm the same symbol.
+    """
+
+    def __init__(
+        self,
+        repo_path: Optional[Path] = None,
+        use_lsp: bool = False,
+        lsp_project_path: Optional[Path] = None,
+    ):
+        """Initialize the multi-source validator.
+
+        Args:
+            repo_path: Path to the repository root for file access.
+            use_lsp: Whether to attempt LSP validation (slower but richer).
+            lsp_project_path: Project path for LSP initialization.
+        """
+        self._repo_path = repo_path
+        self._use_lsp = use_lsp
+        self._lsp_project_path = lsp_project_path
+
+        # Lazy-loaded parsers
+        self._ast_parser = None
+        self._tree_sitter_parser = None
+        self._code_analyzer = None
+
+        # Cache parsed symbols per file to avoid re-parsing
+        self._symbol_cache: dict[str, list] = {}
+
+    def _get_ast_parser(self):
+        """Lazy-load the AST parser."""
+        if self._ast_parser is None:
+            try:
+                from ..analyze.ast_parser import ASTParser
+                self._ast_parser = ASTParser()
+            except ImportError:
+                logger.warning("AST parser not available")
+        return self._ast_parser
+
+    def _get_tree_sitter_parser(self):
+        """Lazy-load the Tree-sitter parser."""
+        if self._tree_sitter_parser is None:
+            try:
+                from ..analyze.tree_sitter import TreeSitterParser
+                self._tree_sitter_parser = TreeSitterParser()
+            except ImportError:
+                logger.warning("Tree-sitter parser not available")
+        return self._tree_sitter_parser
+
+    def _get_code_analyzer(self):
+        """Lazy-load the code analyzer (with LSP support)."""
+        if self._code_analyzer is None and self._use_lsp:
+            try:
+                from ..analyze.code_analyzer import CodeAnalyzer
+                project_path = self._lsp_project_path or self._repo_path
+                self._code_analyzer = CodeAnalyzer(
+                    project_path=project_path,
+                    try_lsp=True
+                )
+            except ImportError:
+                logger.warning("Code analyzer not available")
+            except Exception as e:
+                logger.warning(f"Failed to initialize code analyzer: {e}")
+        return self._code_analyzer
+
+    def _get_file_symbols(self, file_path: Path) -> list:
+        """Get symbols from a file using available parsers.
+
+        Uses caching to avoid re-parsing the same file.
+
+        Args:
+            file_path: Path to the source file.
+
+        Returns:
+            List of symbols (EnhancedSymbol or TSSymbol).
+        """
+        cache_key = str(file_path)
+        if cache_key in self._symbol_cache:
+            return self._symbol_cache[cache_key]
+
+        symbols = []
+        suffix = file_path.suffix.lower()
+
+        # Python files: Use AST parser for rich metadata
+        if suffix == ".py":
+            ast_parser = self._get_ast_parser()
+            if ast_parser:
+                try:
+                    symbols = ast_parser.parse_file_enhanced(file_path)
+                except Exception as e:
+                    logger.debug(f"AST parsing failed for {file_path}: {e}")
+
+        # Multi-language: Use tree-sitter
+        ts_parser = self._get_tree_sitter_parser()
+        if ts_parser and ts_parser.is_supported(file_path):
+            try:
+                ts_symbols = ts_parser.parse_file(file_path)
+                # If AST symbols exist, merge; otherwise use tree-sitter
+                if not symbols:
+                    symbols = ts_symbols
+                else:
+                    # Cross-validate: tree-sitter provides additional confidence
+                    self._symbol_cache[f"{cache_key}:ts"] = ts_symbols
+            except Exception as e:
+                logger.debug(f"Tree-sitter parsing failed for {file_path}: {e}")
+
+        self._symbol_cache[cache_key] = symbols
+        return symbols
+
+    def validate_symbol(
+        self,
+        symbol_name: str,
+        file_path: str,
+        line_number: int,
+        expected_type: Optional[str] = None,
+    ) -> ValidationResult:
+        """Validate a symbol exists using multiple sources.
+
+        Cross-checks the symbol against:
+        1. AST parser (Python files)
+        2. Tree-sitter (multi-language)
+        3. LSP (if enabled and available)
+        4. Direct file content (fallback)
+
+        Args:
+            symbol_name: Name of the symbol to validate.
+            file_path: Relative path to the source file.
+            line_number: Expected line number (1-indexed).
+            expected_type: Expected symbol type (class, function, etc.).
+
+        Returns:
+            ValidationResult with validation details and confidence.
+        """
+        result = ValidationResult(
+            symbol_name=symbol_name,
+            is_valid=False,
+            line_number=line_number,
+        )
+
+        # Resolve full path
+        if self._repo_path:
+            full_path = self._repo_path / file_path
+        else:
+            full_path = Path(file_path)
+
+        if not full_path.exists():
+            result.discrepancies.append(f"File not found: {file_path}")
+            return result
+
+        # 1. Validate with AST parser (Python files)
+        if full_path.suffix.lower() == ".py":
+            self._validate_with_ast(result, full_path, symbol_name, line_number, expected_type)
+
+        # 2. Validate with Tree-sitter (multi-language)
+        self._validate_with_tree_sitter(result, full_path, symbol_name, line_number, expected_type)
+
+        # 3. Validate with LSP (if enabled)
+        if self._use_lsp:
+            self._validate_with_lsp(result, full_path, symbol_name, line_number)
+
+        # 4. Validate with direct file content (fallback)
+        self._validate_with_file_content(result, full_path, symbol_name, line_number)
+
+        # Determine final validity: at least one source must confirm
+        result.is_valid = len(result.sources_confirmed) > 0
+
+        return result
+
+    def _validate_with_ast(
+        self,
+        result: ValidationResult,
+        file_path: Path,
+        symbol_name: str,
+        line_number: int,
+        expected_type: Optional[str],
+    ) -> None:
+        """Validate symbol using Python AST parser.
+
+        Args:
+            result: ValidationResult to update.
+            file_path: Full path to the file.
+            symbol_name: Symbol name to find.
+            line_number: Expected line number.
+            expected_type: Expected symbol type.
+        """
+        result.sources_checked.append(ValidationSource.AST_PARSER)
+
+        ast_parser = self._get_ast_parser()
+        if not ast_parser:
+            return
+
+        try:
+            symbols = self._get_file_symbols(file_path)
+
+            for sym in symbols:
+                # Check for name match
+                if sym.name != symbol_name:
+                    # Also check qualified name for methods
+                    if hasattr(sym, 'qualified_name') and sym.qualified_name != symbol_name:
+                        continue
+                    elif not hasattr(sym, 'qualified_name'):
+                        continue
+
+                # Found symbol by name - verify line is within tolerance
+                line_diff = abs(sym.line - line_number)
+                if line_diff <= 5:  # Allow 5 line tolerance for minor shifts
+                    result.sources_confirmed.append(ValidationSource.AST_PARSER)
+                    result.actual_line = sym.line
+                    result.symbol_kind = sym.kind
+
+                    # Extract rich metadata from AST
+                    if hasattr(sym, 'signature'):
+                        result.signature = sym.signature
+                    if hasattr(sym, 'docstring'):
+                        result.docstring = sym.docstring
+
+                    # Check for line discrepancy
+                    if line_diff > 0:
+                        result.discrepancies.append(
+                            f"AST: line {sym.line} (expected {line_number})"
+                        )
+
+                    # Check type match
+                    if expected_type and sym.kind != expected_type:
+                        result.discrepancies.append(
+                            f"AST: type '{sym.kind}' (expected '{expected_type}')"
+                        )
+
+                    return
+
+            # Symbol not found by name
+            result.discrepancies.append(
+                f"AST: symbol '{symbol_name}' not found in parsed symbols"
+            )
+
+        except Exception as e:
+            logger.debug(f"AST validation error for {file_path}: {e}")
+            result.discrepancies.append(f"AST: parsing error - {e}")
+
+    def _validate_with_tree_sitter(
+        self,
+        result: ValidationResult,
+        file_path: Path,
+        symbol_name: str,
+        line_number: int,
+        expected_type: Optional[str],
+    ) -> None:
+        """Validate symbol using Tree-sitter parser.
+
+        Args:
+            result: ValidationResult to update.
+            file_path: Full path to the file.
+            symbol_name: Symbol name to find.
+            line_number: Expected line number.
+            expected_type: Expected symbol type.
+        """
+        ts_parser = self._get_tree_sitter_parser()
+        if not ts_parser or not ts_parser.is_supported(file_path):
+            return
+
+        result.sources_checked.append(ValidationSource.TREE_SITTER)
+
+        try:
+            # Check if we already have tree-sitter symbols cached
+            cache_key = f"{str(file_path)}:ts"
+            if cache_key in self._symbol_cache:
+                ts_symbols = self._symbol_cache[cache_key]
+            else:
+                ts_symbols = ts_parser.parse_file(file_path)
+                self._symbol_cache[cache_key] = ts_symbols
+
+            for sym in ts_symbols:
+                if sym.name != symbol_name:
+                    continue
+
+                # Found symbol - verify line is within tolerance
+                line_diff = abs(sym.line - line_number)
+                if line_diff <= 5:
+                    result.sources_confirmed.append(ValidationSource.TREE_SITTER)
+
+                    # Update actual line if not set
+                    if result.actual_line is None:
+                        result.actual_line = sym.line
+
+                    # Update kind if not set
+                    if result.symbol_kind is None:
+                        result.symbol_kind = sym.kind
+
+                    if line_diff > 0:
+                        result.discrepancies.append(
+                            f"Tree-sitter: line {sym.line} (expected {line_number})"
+                        )
+
+                    return
+
+            result.discrepancies.append(
+                f"Tree-sitter: symbol '{symbol_name}' not found"
+            )
+
+        except Exception as e:
+            logger.debug(f"Tree-sitter validation error for {file_path}: {e}")
+            result.discrepancies.append(f"Tree-sitter: parsing error - {e}")
+
+    def _validate_with_lsp(
+        self,
+        result: ValidationResult,
+        file_path: Path,
+        symbol_name: str,
+        line_number: int,
+    ) -> None:
+        """Validate symbol using LSP (if available).
+
+        Args:
+            result: ValidationResult to update.
+            file_path: Full path to the file.
+            symbol_name: Symbol name to find.
+            line_number: Expected line number.
+        """
+        analyzer = self._get_code_analyzer()
+        if not analyzer or not analyzer.lsp_available:
+            return
+
+        result.sources_checked.append(ValidationSource.LSP)
+
+        try:
+            # Get symbols from the file via LSP/analyzer
+            analysis_result = analyzer.analyze_file(file_path)
+
+            for sym in analysis_result.symbols:
+                if sym.name != symbol_name:
+                    if hasattr(sym, 'qualified_name') and sym.qualified_name != symbol_name:
+                        continue
+                    elif not hasattr(sym, 'qualified_name'):
+                        continue
+
+                line_diff = abs(sym.line - line_number)
+                if line_diff <= 5:
+                    result.sources_confirmed.append(ValidationSource.LSP)
+
+                    if result.actual_line is None:
+                        result.actual_line = sym.line
+                    if result.symbol_kind is None:
+                        result.symbol_kind = sym.kind
+                    if result.signature is None and hasattr(sym, 'signature'):
+                        result.signature = sym.signature
+
+                    if line_diff > 0:
+                        result.discrepancies.append(
+                            f"LSP: line {sym.line} (expected {line_number})"
+                        )
+
+                    return
+
+            result.discrepancies.append(
+                f"LSP: symbol '{symbol_name}' not found"
+            )
+
+        except Exception as e:
+            logger.debug(f"LSP validation error for {file_path}: {e}")
+            result.discrepancies.append(f"LSP: error - {e}")
+
+    def _validate_with_file_content(
+        self,
+        result: ValidationResult,
+        file_path: Path,
+        symbol_name: str,
+        line_number: int,
+    ) -> None:
+        """Validate symbol exists in file content (fallback method).
+
+        Args:
+            result: ValidationResult to update.
+            file_path: Full path to the file.
+            symbol_name: Symbol name to find.
+            line_number: Expected line number.
+        """
+        result.sources_checked.append(ValidationSource.FILE_CONTENT)
+
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            lines = content.split("\n")
+
+            # Check around the expected line (with tolerance)
+            start_line = max(0, line_number - 6)  # 5 line tolerance + 1 for 0-index
+            end_line = min(len(lines), line_number + 5)
+
+            for i in range(start_line, end_line):
+                if symbol_name in lines[i]:
+                    # Found symbol in nearby line - basic validation passed
+                    result.sources_confirmed.append(ValidationSource.FILE_CONTENT)
+
+                    if result.actual_line is None:
+                        result.actual_line = i + 1  # Convert to 1-indexed
+
+                    # Check for definition patterns
+                    line = lines[i]
+                    if f"class {symbol_name}" in line:
+                        if result.symbol_kind is None:
+                            result.symbol_kind = "class"
+                    elif f"def {symbol_name}" in line:
+                        if result.symbol_kind is None:
+                            result.symbol_kind = "function"
+                    elif f"async def {symbol_name}" in line:
+                        if result.symbol_kind is None:
+                            result.symbol_kind = "async_function"
+                    elif f"function {symbol_name}" in line or f"const {symbol_name}" in line:
+                        if result.symbol_kind is None:
+                            result.symbol_kind = "function"
+
+                    return
+
+            result.discrepancies.append(
+                f"File content: symbol '{symbol_name}' not found near line {line_number}"
+            )
+
+        except Exception as e:
+            logger.debug(f"File content validation error for {file_path}: {e}")
+            result.discrepancies.append(f"File content: read error - {e}")
+
+    def validate_batch(
+        self,
+        symbols: list[dict],
+        on_progress: Optional[Callable] = None,
+    ) -> list[ValidationResult]:
+        """Validate multiple symbols in batch.
+
+        Args:
+            symbols: List of symbol dicts with 'symbol', 'file', 'line', 'type' keys.
+            on_progress: Optional callback for progress updates.
+
+        Returns:
+            List of ValidationResult for each symbol.
+        """
+        results = []
+
+        for i, sym in enumerate(symbols):
+            result = self.validate_symbol(
+                symbol_name=sym.get("symbol", ""),
+                file_path=sym.get("file", ""),
+                line_number=sym.get("line", 0),
+                expected_type=sym.get("type"),
+            )
+            results.append(result)
+
+            if on_progress and (i + 1) % 10 == 0:
+                on_progress(i + 1, len(symbols))
+
+        return results
+
+    def clear_cache(self) -> None:
+        """Clear the symbol cache to free memory."""
+        self._symbol_cache.clear()
+
+    def close(self) -> None:
+        """Clean up resources."""
+        self.clear_cache()
+        if self._code_analyzer:
+            try:
+                self._code_analyzer.close()
+            except Exception:
+                pass
+            self._code_analyzer = None
 
 
 @dataclass
@@ -170,22 +727,56 @@ class DirectDependencyRetriever:
 
     DDR Pipeline:
     1. Search: Find potential matches in symbol catalog
-    2. Validate: Verify each match exists in actual source
+    2. Validate: Verify each match exists in actual source (multi-source)
     3. Extract: Get actual code content with context
     4. Cite: Attach file:line references
 
     Hall_m Target: < 0.02 (2% hallucination rate)
+
+    Multi-Source Validation (Phase 5.2):
+    - AST parser for Python files (rich metadata)
+    - Tree-sitter for multi-language validation
+    - LSP for cross-file references (when enabled)
+    - File content fallback for basic verification
     """
 
     def __init__(
         self,
         codewiki_path: Optional[Path] = None,
         repo_path: Optional[Path] = None,
+        use_multi_source: bool = True,
+        use_lsp: bool = False,
     ):
+        """Initialize the DDR retriever.
+
+        Args:
+            codewiki_path: Path to CodeWiki output directory.
+            repo_path: Path to the actual repository for file access.
+            use_multi_source: Enable multi-source validation (AST + tree-sitter).
+            use_lsp: Enable LSP validation (slower but richer type info).
+        """
         self.codewiki_path = codewiki_path
         self.repo_path = repo_path
         self._symbol_index: dict[str, list[dict]] = {}
         self._loaded = False
+
+        # Multi-source validation (Phase 5.2)
+        self._use_multi_source = use_multi_source
+        self._multi_source_validator: Optional[MultiSourceValidator] = None
+        if use_multi_source and repo_path:
+            self._multi_source_validator = MultiSourceValidator(
+                repo_path=repo_path,
+                use_lsp=use_lsp,
+                lsp_project_path=repo_path,
+            )
+
+        # Validation statistics
+        self._validation_stats = {
+            "total_validated": 0,
+            "multi_source_confirmed": 0,
+            "high_confidence_count": 0,
+            "sources_used": {},
+        }
 
     def load_symbol_catalog(self, catalog_path: Path) -> None:
         """Load and index the symbol catalog from CodeWiki."""
@@ -420,23 +1011,90 @@ class DirectDependencyRetriever:
         return exact_matches + partial_matches + word_matches
 
     def _validate_and_extract(self, candidate: dict) -> Optional[CodeElement]:
-        """Validate candidate exists and extract actual content."""
+        """Validate candidate exists and extract actual content.
+
+        Uses multi-source validation when enabled (Phase 5.2):
+        1. AST parser for Python files
+        2. Tree-sitter for multi-language support
+        3. LSP for type information (when enabled)
+        4. File content as fallback
+
+        Args:
+            candidate: Symbol candidate dict from symbol index.
+
+        Returns:
+            CodeElement if validated, None otherwise.
+        """
         file_path = candidate.get("file", "")
         line_num = candidate.get("line", 0)
         symbol = candidate.get("symbol", "")
         url = candidate.get("url", "")
+        expected_type = candidate.get("type", "unknown")
 
         # Create source ref
         source_ref = SourceRef(
             symbol_name=symbol,
             file_path=file_path,
             line_number=line_num,
-            symbol_type=candidate.get("type", "unknown"),
+            symbol_type=expected_type,
             signature=candidate.get("signature"),
             validated=False,
         )
 
-        # Validate against actual source (if repo available)
+        # Multi-source validation (Phase 5.2)
+        if self._multi_source_validator and file_path:
+            validation_result = self._multi_source_validator.validate_symbol(
+                symbol_name=symbol,
+                file_path=file_path,
+                line_number=line_num,
+                expected_type=expected_type if expected_type != "unknown" else None,
+            )
+
+            if validation_result.is_valid:
+                # Update source ref with validated data
+                source_ref.validated = True
+                if validation_result.actual_line:
+                    source_ref.line_number = validation_result.actual_line
+                if validation_result.symbol_kind:
+                    source_ref.symbol_type = validation_result.symbol_kind
+                if validation_result.signature:
+                    source_ref.signature = validation_result.signature
+                if validation_result.docstring:
+                    source_ref.docstring = validation_result.docstring
+
+                # Update validation statistics
+                self._update_validation_stats(validation_result)
+
+                # Extract content from validated location
+                content = ""
+                context = ""
+                if self.repo_path:
+                    full_path = self.repo_path / file_path
+                    if full_path.exists():
+                        content, context = self._extract_content(
+                            full_path, source_ref.line_number, symbol
+                        )
+
+                if not content:
+                    # Fallback content with validation info
+                    confidence_str = f"{validation_result.confidence:.0%}"
+                    sources_str = ", ".join(s.value for s in validation_result.sources_confirmed)
+                    content = f"# {symbol}\n# Location: {file_path}:{source_ref.line_number}\n# Confidence: {confidence_str} ({sources_str})"
+
+                return CodeElement(
+                    source_ref=source_ref,
+                    content=content,
+                    context=context,
+                )
+
+            # Multi-source validation failed - log and try fallbacks
+            if validation_result.discrepancies:
+                logger.debug(
+                    f"Multi-source validation failed for {symbol}: "
+                    f"{', '.join(validation_result.discrepancies[:3])}"
+                )
+
+        # Fallback: Validate against actual source (if repo available)
         if self.repo_path:
             full_path = self.repo_path / file_path
             if full_path.exists():
@@ -449,7 +1107,7 @@ class DirectDependencyRetriever:
                         context=context,
                     )
 
-        # Without repo, validate from CodeWiki sections
+        # Fallback: Validate from CodeWiki sections
         content = self._extract_from_codewiki(file_path, line_num, symbol)
         if content:
             source_ref.validated = True
@@ -459,8 +1117,7 @@ class DirectDependencyRetriever:
                 context="",
             )
 
-        # If we have a URL from the symbol catalog, we can trust it
-        # (it was extracted from the actual source)
+        # Fallback: Trust URL from symbol catalog (extracted from actual source)
         if url and file_path and line_num > 0:
             source_ref.validated = True
             return CodeElement(
@@ -469,8 +1126,7 @@ class DirectDependencyRetriever:
                 context="",
             )
 
-        # Trust entries from symbol catalog with file path and line number
-        # (they were extracted from actual source code)
+        # Fallback: Trust entries from symbol catalog with file path and line
         if file_path and line_num > 0:
             source_ref.validated = True
             return CodeElement(
@@ -480,6 +1136,101 @@ class DirectDependencyRetriever:
             )
 
         return None
+
+    def _update_validation_stats(self, result: ValidationResult) -> None:
+        """Update validation statistics from a validation result.
+
+        Args:
+            result: ValidationResult from multi-source validation.
+        """
+        self._validation_stats["total_validated"] += 1
+
+        if len(result.sources_confirmed) > 1:
+            self._validation_stats["multi_source_confirmed"] += 1
+
+        if result.is_high_confidence:
+            self._validation_stats["high_confidence_count"] += 1
+
+        # Track which sources were used
+        for source in result.sources_confirmed:
+            source_name = source.value
+            if source_name not in self._validation_stats["sources_used"]:
+                self._validation_stats["sources_used"][source_name] = 0
+            self._validation_stats["sources_used"][source_name] += 1
+
+    def get_validation_stats(self) -> dict:
+        """Get multi-source validation statistics.
+
+        Returns:
+            Dictionary with validation statistics.
+        """
+        stats = self._validation_stats.copy()
+        total = stats["total_validated"]
+        if total > 0:
+            stats["multi_source_rate"] = stats["multi_source_confirmed"] / total
+            stats["high_confidence_rate"] = stats["high_confidence_count"] / total
+        else:
+            stats["multi_source_rate"] = 0.0
+            stats["high_confidence_rate"] = 0.0
+        return stats
+
+    def reset_validation_stats(self) -> None:
+        """Reset validation statistics."""
+        self._validation_stats = {
+            "total_validated": 0,
+            "multi_source_confirmed": 0,
+            "high_confidence_count": 0,
+            "sources_used": {},
+        }
+
+    def validate_symbol_multi_source(
+        self,
+        symbol_name: str,
+        file_path: str,
+        line_number: int,
+        expected_type: Optional[str] = None,
+    ) -> ValidationResult:
+        """Directly validate a symbol using multi-source validation.
+
+        Convenience method for direct symbol validation without going
+        through the full DDR retrieval pipeline.
+
+        Args:
+            symbol_name: Name of the symbol to validate.
+            file_path: Relative path to the source file.
+            line_number: Expected line number (1-indexed).
+            expected_type: Expected symbol type (class, function, etc.).
+
+        Returns:
+            ValidationResult with validation details and confidence.
+        """
+        if not self._multi_source_validator:
+            # Create temporary validator
+            validator = MultiSourceValidator(
+                repo_path=self.repo_path,
+                use_lsp=False,
+            )
+            result = validator.validate_symbol(
+                symbol_name=symbol_name,
+                file_path=file_path,
+                line_number=line_number,
+                expected_type=expected_type,
+            )
+            validator.close()
+            return result
+
+        return self._multi_source_validator.validate_symbol(
+            symbol_name=symbol_name,
+            file_path=file_path,
+            line_number=line_number,
+            expected_type=expected_type,
+        )
+
+    def close(self) -> None:
+        """Clean up resources including multi-source validator."""
+        if self._multi_source_validator:
+            self._multi_source_validator.close()
+            self._multi_source_validator = None
 
     def _extract_content(
         self,
@@ -889,6 +1640,7 @@ def retrieve_validated(
     codewiki_path: Path,
     repo_path: Optional[Path] = None,
     max_results: int = 20,
+    use_multi_source: bool = True,
 ) -> DDRResult:
     """Retrieve validated code elements for a query.
 
@@ -897,12 +1649,19 @@ def retrieve_validated(
         codewiki_path: Path to CodeWiki output directory
         repo_path: Optional path to actual repository
         max_results: Maximum elements to return
+        use_multi_source: Enable multi-source validation (AST + tree-sitter)
 
     Returns:
         DDRResult with only validated elements
     """
-    ddr = DirectDependencyRetriever(codewiki_path, repo_path)
-    return ddr.retrieve(query, max_results)
+    ddr = DirectDependencyRetriever(
+        codewiki_path, repo_path,
+        use_multi_source=use_multi_source,
+    )
+    try:
+        return ddr.retrieve(query, max_results)
+    finally:
+        ddr.close()
 
 
 def retrieve_batch_validated(
@@ -913,6 +1672,7 @@ def retrieve_batch_validated(
     on_progress: Optional[Callable[[BatchProgress], None]] = None,
     parallel: bool = False,
     max_workers: int = 4,
+    use_multi_source: bool = True,
 ) -> BatchResult:
     """Retrieve validated code elements for multiple queries.
 
@@ -926,31 +1686,39 @@ def retrieve_batch_validated(
         on_progress: Optional callback for progress updates
         parallel: Use parallel processing (for 100+ queries)
         max_workers: Number of parallel workers
+        use_multi_source: Enable multi-source validation (AST + tree-sitter)
 
     Returns:
         BatchResult with all validated elements
     """
-    ddr = DirectDependencyRetriever(codewiki_path, repo_path)
+    ddr = DirectDependencyRetriever(
+        codewiki_path, repo_path,
+        use_multi_source=use_multi_source,
+    )
 
-    if parallel and len(queries) > 50:
-        return ddr.retrieve_batch_parallel(
-            queries,
-            max_results_per_query,
-            on_progress,
-            max_workers,
-        )
-    else:
-        return ddr.retrieve_batch(
-            queries,
-            max_results_per_query,
-            on_progress,
-        )
+    try:
+        if parallel and len(queries) > 50:
+            return ddr.retrieve_batch_parallel(
+                queries,
+                max_results_per_query,
+                on_progress,
+                max_workers,
+            )
+        else:
+            return ddr.retrieve_batch(
+                queries,
+                max_results_per_query,
+                on_progress,
+            )
+    finally:
+        ddr.close()
 
 
 def retrieve_all_proven_links(
     codewiki_path: Path,
     repo_path: Optional[Path] = None,
     on_progress: Optional[Callable[[BatchProgress], None]] = None,
+    use_multi_source: bool = True,
 ) -> BatchResult:
     """Retrieve ALL PROVEN links without any LIMIT constraints.
 
@@ -961,9 +1729,60 @@ def retrieve_all_proven_links(
         codewiki_path: Path to CodeWiki output directory
         repo_path: Optional path to actual repository
         on_progress: Optional callback for progress updates
+        use_multi_source: Enable multi-source validation (AST + tree-sitter)
 
     Returns:
         BatchResult with all validated PROVEN links
     """
-    ddr = DirectDependencyRetriever(codewiki_path, repo_path)
-    return ddr.retrieve_all_proven_links(on_progress)
+    ddr = DirectDependencyRetriever(
+        codewiki_path, repo_path,
+        use_multi_source=use_multi_source,
+    )
+    try:
+        return ddr.retrieve_all_proven_links(on_progress)
+    finally:
+        ddr.close()
+
+
+def validate_symbol(
+    symbol_name: str,
+    file_path: str,
+    line_number: int,
+    repo_path: Path,
+    expected_type: Optional[str] = None,
+    use_lsp: bool = False,
+) -> ValidationResult:
+    """Validate a symbol using multi-source validation.
+
+    Convenience function for direct symbol validation without DDR retrieval.
+
+    Args:
+        symbol_name: Name of the symbol to validate.
+        file_path: Relative path to the source file.
+        line_number: Expected line number (1-indexed).
+        repo_path: Path to the repository root.
+        expected_type: Expected symbol type (class, function, etc.).
+        use_lsp: Enable LSP validation (slower but richer type info).
+
+    Returns:
+        ValidationResult with validation details and confidence.
+
+    Example:
+        >>> result = validate_symbol("StateGraph", "langgraph/state.py", 50, Path("./repo"))
+        >>> if result.is_valid:
+        ...     print(f"Validated with {result.confidence:.0%} confidence")
+        ...     print(f"Sources: {[s.value for s in result.sources_confirmed]}")
+    """
+    validator = MultiSourceValidator(
+        repo_path=repo_path,
+        use_lsp=use_lsp,
+    )
+    try:
+        return validator.validate_symbol(
+            symbol_name=symbol_name,
+            file_path=file_path,
+            line_number=line_number,
+            expected_type=expected_type,
+        )
+    finally:
+        validator.close()
