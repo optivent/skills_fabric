@@ -930,40 +930,107 @@ class BraveSearchClient:
     async def search_guidelines(
         self,
         topic: str,
+        domain: str = "software",
         country: Optional[str] = None,
         count: int = 10,
         freshness: Optional[Freshness] = Freshness.YEAR,
     ) -> BraveSearchResponse:
-        """Search specifically for clinical practice guidelines and standards.
+        """Search for guidelines, best practices, and standards.
 
-        Optimized for finding official guidelines, treatment protocols,
-        and best practice recommendations from authoritative sources.
+        Supports multiple domains:
+        - software: API design, coding standards, architectural patterns
+        - medical: Clinical practice guidelines, treatment protocols
+        - security: Security best practices, compliance standards
+        - devops: CI/CD, infrastructure, deployment patterns
+        - data_science: ML/AI best practices, data engineering patterns
 
         Args:
-            topic: Topic area (e.g., "diabetes treatment", "async programming")
-            country: Optional country filter (e.g., "USA", "UK", "EU")
+            topic: Topic area (e.g., "REST API design", "diabetes treatment")
+            domain: Domain type - "software", "medical", "security", "devops", "data_science"
+            country: Optional country filter for medical domain (e.g., "USA", "UK", "EU")
             count: Number of results
             freshness: Time filter (defaults to past year)
 
         Returns:
             BraveSearchResponse with guideline results
         """
-        # Build guideline-specific query
-        query_parts = [
-            topic,
-            "clinical practice guideline OR treatment guideline OR management guideline OR best practice OR standard of care",
-        ]
-
-        # Country-specific guideline organizations
-        country_orgs = {
-            "USA": "AAO OR AAFP OR ADA OR AMA OR site:aao.org OR site:guidelines.gov OR site:cdc.gov OR site:fda.gov",
-            "UK": "NICE OR NHS OR site:nice.org.uk OR site:nhs.uk",
-            "EU": "EMA OR ESCRS OR site:ema.europa.eu OR site:who.int",
-            "WHO": "site:who.int OR World Health Organization",
+        # Domain-specific guideline query patterns
+        domain_patterns = {
+            "software": {
+                "query_suffix": "best practice OR style guide OR design guideline OR coding standard OR architectural pattern",
+                "sites": [
+                    "site:google.github.io/styleguide",
+                    "site:docs.microsoft.com",
+                    "site:developer.mozilla.org",
+                    "site:martin.fowler.com",
+                    "site:refactoring.guru",
+                    "site:12factor.net",
+                ],
+            },
+            "medical": {
+                "query_suffix": "clinical practice guideline OR treatment guideline OR management guideline OR standard of care",
+                "sites": [
+                    "site:cdc.gov",
+                    "site:nih.gov",
+                    "site:who.int",
+                    "site:nice.org.uk",
+                    "site:cochrane.org",
+                ],
+            },
+            "security": {
+                "query_suffix": "security best practice OR security guideline OR compliance standard OR security framework",
+                "sites": [
+                    "site:owasp.org",
+                    "site:nist.gov",
+                    "site:cisecurity.org",
+                    "site:sans.org",
+                    "site:cisa.gov",
+                ],
+            },
+            "devops": {
+                "query_suffix": "best practice OR pattern OR guideline OR infrastructure as code",
+                "sites": [
+                    "site:kubernetes.io",
+                    "site:docker.com",
+                    "site:terraform.io",
+                    "site:aws.amazon.com/architecture",
+                    "site:cloud.google.com/architecture",
+                ],
+            },
+            "data_science": {
+                "query_suffix": "best practice OR guideline OR pattern OR MLOps",
+                "sites": [
+                    "site:scikit-learn.org",
+                    "site:tensorflow.org",
+                    "site:pytorch.org",
+                    "site:ml-ops.org",
+                    "site:papers.nips.cc",
+                ],
+            },
         }
 
-        if country and country.upper() in country_orgs:
-            query_parts.append(country_orgs[country.upper()])
+        # Get domain pattern or default to software
+        domain_lower = domain.lower() if domain else "software"
+        pattern = domain_patterns.get(domain_lower, domain_patterns["software"])
+
+        # Build query
+        query_parts = [topic, pattern["query_suffix"]]
+
+        # Add site filters
+        if pattern["sites"]:
+            site_filter = " OR ".join(pattern["sites"])
+            query_parts.append(f"({site_filter})")
+
+        # Add country-specific filters for medical domain
+        if domain_lower == "medical" and country:
+            country_orgs = {
+                "USA": "AAO OR AAFP OR ADA OR AMA OR site:aao.org OR site:guidelines.gov OR site:cdc.gov OR site:fda.gov",
+                "UK": "NICE OR NHS OR site:nice.org.uk OR site:nhs.uk",
+                "EU": "EMA OR ESCRS OR site:ema.europa.eu",
+                "WHO": "site:who.int OR World Health Organization",
+            }
+            if country.upper() in country_orgs:
+                query_parts.append(country_orgs[country.upper()])
 
         query = " ".join(query_parts)
 
@@ -1302,11 +1369,12 @@ class BraveSearchClient:
     def search_guidelines_sync(
         self,
         topic: str,
+        domain: str = "software",
         country: Optional[str] = None,
         **kwargs,
     ) -> BraveSearchResponse:
         """Synchronous wrapper for search_guidelines()."""
-        return asyncio.run(self.search_guidelines(topic, country, **kwargs))
+        return asyncio.run(self.search_guidelines(topic, domain=domain, country=country, **kwargs))
 
     def get_stats(self) -> dict:
         """Get client statistics."""
@@ -1462,16 +1530,32 @@ NOTE:
         if args.json:
             print(json.dumps(response.to_dict(), indent=2))
         else:
-            print(f"Search: {response.query}")
+            # Determine search type for header
+            search_type = "Guidelines" if args.guidelines else "Academic" if args.academic else "Technical" if args.technical else "News" if args.news else "Web"
+            print(f"Search ({search_type}): {response.query}")
             print(f"Results: {response.result_count}")
             print()
             for i, r in enumerate(response.results, 1):
                 print(f"{i}. {r.title}")
                 print(f"   URL: {r.url}")
+                print(f"   Domain: {r.domain}", end="")
+                if r.domain_authority:
+                    print(f" ({r.domain_authority.category})", end="")
+                    if r.is_primary_source:
+                        print(" ★", end="")
+                print()
                 if r.date:
                     print(f"   Date: {r.date}")
-                print(f"   {r.description[:100]}...")
-                print(f"   Relevance: {r.relevance_score:.2f}")
+                if r.content_type != ContentType.UNKNOWN:
+                    print(f"   Type: {r.content_type.value}")
+                desc = r.description[:120] + "..." if len(r.description) > 120 else r.description
+                print(f"   {desc}")
+                # Show relevance with score breakdown
+                print(f"   Relevance: {r.relevance_score:.3f}", end="")
+                if r.position_score > 0 or r.query_match_score > 0:
+                    print(f" [pos={r.position_score:.2f}, match={r.query_match_score:.2f}, "
+                          f"fresh={r.freshness_score:.2f}, trust={r.trust_score:.2f}]", end="")
+                print()
                 print()
 
     asyncio.run(run())
