@@ -12,6 +12,8 @@ This client defaults to the CODING endpoint for use with coding tools.
 Features:
 - OpenAI-compatible API
 - Preserved thinking mode (reasoning persists across turns)
+- thinking_budget parameter for controlling reasoning token limits
+- Thinking metrics tracking and logging
 - Streaming support
 - Cost tracking (Coding Plan: reduced rates)
 
@@ -23,6 +25,26 @@ Usage:
 
     # Or explicitly use general API
     client = GLMClient(api_key="your-key", use_coding_endpoint=False)
+
+    # With custom thinking budget for reasoning tasks
+    response = client.generate(
+        messages=[{"role": "user", "content": "Explain this code"}],
+        thinking=True,
+        thinking_budget=32000  # Up to 32K reasoning tokens
+    )
+
+    # Code explanation with thinking
+    response = client.explain_code(
+        code="def foo(): pass",
+        language="python"
+    )
+    print(f"Thinking tokens used: {response.usage.thinking_tokens}")
+    print(f"Budget used: {response.usage.thinking_budget_used_pct:.1f}%")
+
+    # Multi-turn agent with preserved thinking
+    agent = GLMCodingAgent(thinking_budget=24000)
+    response = agent.send("Explain this function")
+    print(agent.get_thinking_usage())
 """
 from dataclasses import dataclass, field
 from typing import Optional, Iterator, Any
@@ -30,6 +52,10 @@ from enum import Enum
 import os
 import json
 import time
+import logging
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 # Try to import httpx for async support, fall back to requests
 try:
@@ -54,13 +80,29 @@ class TokenUsage:
     completion_tokens: int = 0
     thinking_tokens: int = 0
     total_tokens: int = 0
+    thinking_budget: int = 0  # Allocated thinking budget
 
     @property
     def cost_usd(self) -> float:
-        """Calculate cost in USD."""
+        """Calculate cost in USD (Z.ai Coding Plan rates)."""
         input_cost = (self.prompt_tokens / 1_000_000) * 0.60
         output_cost = ((self.completion_tokens + self.thinking_tokens) / 1_000_000) * 2.20
         return input_cost + output_cost
+
+    @property
+    def thinking_budget_used_pct(self) -> float:
+        """Percentage of thinking budget used."""
+        if self.thinking_budget <= 0:
+            return 0.0
+        return min(100.0, (self.thinking_tokens / self.thinking_budget) * 100)
+
+    @property
+    def thinking_budget_exhausted(self) -> bool:
+        """Check if thinking budget was fully consumed (reasoning may be truncated)."""
+        if self.thinking_budget <= 0:
+            return False
+        # Consider exhausted if >95% used (buffer for estimation variance)
+        return self.thinking_tokens >= (self.thinking_budget * 0.95)
 
 
 @dataclass
@@ -72,10 +114,17 @@ class GLMResponse:
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = "glm-4.7"
     latency_ms: float = 0.0
+    thinking_budget_used: int = 0  # How many thinking tokens were used
 
     @property
     def has_thinking(self) -> bool:
+        """Check if response includes thinking content."""
         return self.thinking is not None and len(self.thinking) > 0
+
+    @property
+    def thinking_truncated(self) -> bool:
+        """Check if thinking may have been truncated due to budget limits."""
+        return self.usage.thinking_budget_exhausted
 
 
 # API Endpoints
@@ -95,6 +144,7 @@ class GLMConfig:
     top_p: float = 0.95
     timeout: int = 120
     thinking_mode: ThinkingMode = ThinkingMode.ENABLED
+    thinking_budget: int = 16000  # Max reasoning tokens (default 16K for GLM-4.7)
 
     @classmethod
     def from_env(cls, use_coding_endpoint: bool = True) -> "GLMConfig":
@@ -108,6 +158,7 @@ class GLMConfig:
             ZAI_BASE_URL: Override base URL
             ZAI_USE_CODING: Set to "false" to use general endpoint
             GLM_MODEL: Model name (default glm-4.7)
+            GLM_THINKING_BUDGET: Max reasoning tokens (default 16000)
         """
         # Check env var for endpoint preference
         env_use_coding = os.getenv("ZAI_USE_CODING", "true").lower() != "false"
@@ -117,11 +168,15 @@ class GLMConfig:
         default_url = CODING_BASE_URL if use_coding else GENERAL_BASE_URL
         base_url = os.getenv("ZAI_BASE_URL", default_url)
 
+        # Get thinking budget from env (default 16K)
+        thinking_budget = int(os.getenv("GLM_THINKING_BUDGET", "16000"))
+
         return cls(
             api_key=os.getenv("ZAI_API_KEY", os.getenv("GLM_API_KEY", "")),
             base_url=base_url,
             model=os.getenv("GLM_MODEL", "glm-4.7"),
             use_coding_endpoint=use_coding,
+            thinking_budget=thinking_budget,
         )
 
 
@@ -180,6 +235,7 @@ class GLMClient:
         messages: list[dict],
         thinking: bool = True,
         preserve_thinking: bool = False,
+        thinking_budget: Optional[int] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         stream: bool = False,
@@ -191,6 +247,7 @@ class GLMClient:
             messages: List of messages in OpenAI format
             thinking: Enable thinking mode
             preserve_thinking: Keep thinking across turns (for agents)
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
             max_tokens: Override max tokens
             temperature: Override temperature
             stream: Enable streaming (returns iterator)
@@ -209,16 +266,25 @@ class GLMClient:
             "stream": stream,
         }
 
-        # Configure thinking mode
+        # Use provided budget or config default
+        budget = thinking_budget or self.config.thinking_budget
+
+        # Configure thinking mode with budget_tokens (Z.ai format)
         if thinking:
             if preserve_thinking:
-                payload["thinking"] = {"type": "enabled"}
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
                 payload["chat_template_kwargs"] = {
                     "enable_thinking": True,
                     "clear_thinking": False,  # Preserve across turns
                 }
             else:
-                payload["thinking"] = {"type": "enabled"}
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
         else:
             payload["thinking"] = {"type": "disabled"}
 
@@ -238,7 +304,10 @@ class GLMClient:
         if stream:
             return self._parse_stream(response, latency_ms)
         else:
-            return self._parse_response(response, latency_ms)
+            # Pass the thinking budget for tracking
+            return self._parse_response(
+                response, latency_ms, thinking_budget=budget if thinking else 0
+            )
 
     def _request_httpx(self, payload: dict, stream: bool) -> Any:
         """Make request using httpx."""
@@ -262,28 +331,43 @@ class GLMClient:
         response.raise_for_status()
         return response.json()
 
-    def _parse_response(self, data: dict, latency_ms: float) -> GLMResponse:
-        """Parse API response into GLMResponse."""
+    def _parse_response(
+        self, data: dict, latency_ms: float, thinking_budget: int = 0
+    ) -> GLMResponse:
+        """Parse API response into GLMResponse.
+
+        Args:
+            data: Raw API response data
+            latency_ms: Request latency in milliseconds
+            thinking_budget: The thinking budget that was used for this request
+        """
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
 
-        # Extract content and thinking
+        # Extract content and thinking (GLM-4.7 uses reasoning_content)
         content = message.get("content", "")
         thinking = None
 
-        # Check for thinking in message
+        # Check for thinking in message (GLM-4.7 format: reasoning_content)
         if "thinking" in message:
             thinking = message["thinking"]
         elif "reasoning_content" in message:
             thinking = message["reasoning_content"]
 
-        # Parse usage
+        # GLM-4.7: If content is empty but reasoning exists, use reasoning as content
+        # This is a known behavior of GLM thinking models
+        if not content and thinking:
+            content = thinking
+
+        # Parse usage with thinking_budget tracking
         usage_data = data.get("usage", {})
+        thinking_tokens = usage_data.get("thinking_tokens", 0)
         usage = TokenUsage(
             prompt_tokens=usage_data.get("prompt_tokens", 0),
             completion_tokens=usage_data.get("completion_tokens", 0),
-            thinking_tokens=usage_data.get("thinking_tokens", 0),
+            thinking_tokens=thinking_tokens,
             total_tokens=usage_data.get("total_tokens", 0),
+            thinking_budget=thinking_budget,  # Track allocated budget
         )
 
         # Track cumulative usage
@@ -291,6 +375,7 @@ class GLMClient:
         self._total_usage.completion_tokens += usage.completion_tokens
         self._total_usage.thinking_tokens += usage.thinking_tokens
         self._total_usage.total_tokens += usage.total_tokens
+        self._total_usage.thinking_budget += thinking_budget
 
         return GLMResponse(
             content=content,
@@ -299,6 +384,7 @@ class GLMClient:
             usage=usage,
             model=data.get("model", self.config.model),
             latency_ms=latency_ms,
+            thinking_budget_used=thinking_tokens,  # Track actual usage
         )
 
     def _parse_stream(self, response: Any, latency_ms: float) -> Iterator[str]:
@@ -312,6 +398,7 @@ class GLMClient:
         user_message: str,
         system_prompt: Optional[str] = None,
         thinking: bool = True,
+        thinking_budget: Optional[int] = None,
     ) -> GLMResponse:
         """Simple chat interface.
 
@@ -319,6 +406,7 @@ class GLMClient:
             user_message: User's message
             system_prompt: Optional system prompt
             thinking: Enable thinking mode
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
 
         Returns:
             GLMResponse
@@ -330,7 +418,7 @@ class GLMClient:
 
         messages.append({"role": "user", "content": user_message})
 
-        return self.generate(messages, thinking=thinking)
+        return self.generate(messages, thinking=thinking, thinking_budget=thinking_budget)
 
     def code_generation(
         self,
@@ -361,6 +449,105 @@ Follow best practices for {language}."""
             system_prompt=system_prompt,
             thinking=True,
         )
+
+    def explain_code(
+        self,
+        code: str,
+        language: str = "python",
+        thinking_budget: Optional[int] = None,
+        detail_level: str = "comprehensive",
+    ) -> GLMResponse:
+        """Explain code using GLM-4.7 with thinking mode.
+
+        Uses extended thinking budget to provide deep code analysis.
+        This is a reasoning-intensive task that benefits from higher thinking budgets.
+
+        Args:
+            code: The source code to explain
+            language: Programming language of the code
+            thinking_budget: Max reasoning tokens (default: 24000 for explanation tasks)
+            detail_level: "brief", "moderate", or "comprehensive"
+
+        Returns:
+            GLMResponse with explanation and thinking process
+
+        Example:
+            response = client.explain_code(
+                code=\"\"\"
+                def quicksort(arr):
+                    if len(arr) <= 1:
+                        return arr
+                    pivot = arr[len(arr) // 2]
+                    left = [x for x in arr if x < pivot]
+                    middle = [x for x in arr if x == pivot]
+                    right = [x for x in arr if x > pivot]
+                    return quicksort(left) + middle + quicksort(right)
+                \"\"\",
+                language="python",
+                thinking_budget=32000
+            )
+            print(f"Thinking used: {response.usage.thinking_budget_used_pct:.1f}%")
+            print(response.content)
+        """
+        # Use higher default budget for explanation tasks (reasoning-heavy)
+        budget = thinking_budget or 24000
+
+        # Customize prompt based on detail level
+        detail_instructions = {
+            "brief": "Provide a concise summary of what this code does (2-3 sentences).",
+            "moderate": "Explain the code's purpose, key functions, and general flow.",
+            "comprehensive": """Provide a comprehensive explanation including:
+1. Overall purpose and functionality
+2. Step-by-step breakdown of the logic
+3. Key data structures and algorithms used
+4. Potential edge cases or limitations
+5. Suggestions for improvement (if applicable)""",
+        }
+
+        instruction = detail_instructions.get(detail_level, detail_instructions["comprehensive"])
+
+        system_prompt = f"""You are an expert code analyst specializing in {language}.
+Your task is to explain code clearly and thoroughly.
+Use your thinking process to analyze the code deeply before explaining.
+{instruction}"""
+
+        user_message = f"""Please explain this {language} code:
+
+```{language}
+{code}
+```"""
+
+        # Log the reasoning task
+        logger.debug(
+            f"explain_code: language={language}, detail={detail_level}, "
+            f"budget={budget}, code_len={len(code)}"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        response = self.generate(
+            messages=messages,
+            thinking=True,
+            thinking_budget=budget,
+        )
+
+        # Log thinking metrics
+        if response.usage.thinking_budget_exhausted:
+            logger.warning(
+                f"explain_code: Thinking budget exhausted "
+                f"({response.usage.thinking_tokens}/{budget} tokens). "
+                f"Response may be truncated. Consider increasing thinking_budget."
+            )
+        else:
+            logger.debug(
+                f"explain_code: Thinking used {response.usage.thinking_budget_used_pct:.1f}% "
+                f"of budget ({response.usage.thinking_tokens}/{budget} tokens)"
+            )
+
+        return response
 
     def get_total_usage(self) -> TokenUsage:
         """Get cumulative token usage."""
@@ -587,23 +774,33 @@ class GLMCodingAgent:
 
     Maintains conversation history and thinking state
     across multiple turns for complex coding tasks.
+
+    Example:
+        agent = GLMCodingAgent(thinking_budget=32000)
+        response = agent.send("Explain how this code works")
+        print(f"Thinking used: {response.thinking_budget_used} tokens")
+        print(f"Response: {response.content}")
     """
 
     def __init__(
         self,
         client: Optional[GLMClient] = None,
         system_prompt: Optional[str] = None,
+        thinking_budget: int = 16000,
     ):
         """Initialize coding agent.
 
         Args:
             client: GLM client instance
             system_prompt: Custom system prompt
+            thinking_budget: Max tokens for reasoning per turn (default 16K)
         """
         self.client = client or GLMClient()
         self.system_prompt = system_prompt or self._default_system_prompt()
+        self.thinking_budget = thinking_budget
         self.messages: list[dict] = []
         self.thinking_history: list[str] = []
+        self.total_thinking_tokens: int = 0  # Track cumulative thinking usage
 
         # Initialize with system prompt
         self.messages.append({
@@ -632,12 +829,14 @@ Think step by step before providing solutions."""
         self,
         message: str,
         preserve_thinking: bool = True,
+        thinking_budget: Optional[int] = None,
     ) -> GLMResponse:
         """Send a message and get response.
 
         Args:
             message: User message
             preserve_thinking: Keep thinking across turns
+            thinking_budget: Override thinking budget for this turn
 
         Returns:
             GLMResponse
@@ -648,11 +847,15 @@ Think step by step before providing solutions."""
             "content": message,
         })
 
+        # Use provided budget or instance default
+        budget = thinking_budget or self.thinking_budget
+
         # Generate response
         response = self.client.generate(
             messages=self.messages,
             thinking=True,
             preserve_thinking=preserve_thinking,
+            thinking_budget=budget,
         )
 
         # Add assistant response to history
@@ -664,6 +867,7 @@ Think step by step before providing solutions."""
         # Track thinking
         if response.thinking:
             self.thinking_history.append(response.thinking)
+        self.total_thinking_tokens += response.thinking_budget_used
 
         return response
 
@@ -674,10 +878,26 @@ Think step by step before providing solutions."""
             "content": self.system_prompt,
         }]
         self.thinking_history = []
+        self.total_thinking_tokens = 0
 
     def get_conversation(self) -> list[dict]:
         """Get full conversation history."""
         return self.messages.copy()
+
+    def get_thinking_usage(self) -> dict:
+        """Get thinking token usage for this conversation.
+
+        Returns:
+            dict with thinking usage metrics
+        """
+        return {
+            "total_thinking_tokens": self.total_thinking_tokens,
+            "thinking_turns": len(self.thinking_history),
+            "average_per_turn": (
+                self.total_thinking_tokens / len(self.thinking_history)
+                if self.thinking_history else 0
+            ),
+        }
 
 
 # OpenAI-compatible wrapper for drop-in replacement
