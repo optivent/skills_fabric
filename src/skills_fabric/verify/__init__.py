@@ -5,13 +5,22 @@ Components:
 - CrossLayer: Multi-layer verification across iceberg layers
 - Sandbox: Isolated code execution
 - Tracer: Execution tracing
+
+Batch Processing:
+- BatchProgress: Progress tracking for large batches
+- BatchResult: Result aggregation for batch operations
+- retrieve_all_proven: Retrieve ALL PROVEN links without LIMIT constraints
 """
 from .ddr import (
     DirectDependencyRetriever,
     SourceRef,
     CodeElement,
     DDRResult,
+    BatchProgress,
+    BatchResult,
     retrieve_validated,
+    retrieve_batch_validated,
+    retrieve_all_proven_links,
 )
 from .cross_layer import (
     CrossLayerVerifier,
@@ -25,7 +34,11 @@ __all__ = [
     "SourceRef",
     "CodeElement",
     "DDRResult",
+    "BatchProgress",
+    "BatchResult",
     "retrieve_validated",
+    "retrieve_batch_validated",
+    "retrieve_all_proven_links",
     # Cross-layer
     "CrossLayerVerifier",
     "CrossLayerResult",

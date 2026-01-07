@@ -12,12 +12,23 @@ Integration:
 - Works with CodeWiki extracted data
 - Validates against symbol_catalog.md
 - Produces SourceRef citations for all elements
+
+Batch Processing:
+- Processes ALL concepts without artificial limits
+- Tracks progress for large batches
+- Supports async batch validation for efficiency
 """
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import json
+import time
+
+from ..observability.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -83,6 +94,75 @@ class DDRResult:
     def success(self) -> bool:
         """Retrieval successful if we have validated elements."""
         return self.validated_count > 0 and self.hallucination_rate < 0.02
+
+
+@dataclass
+class BatchProgress:
+    """Progress tracking for batch operations."""
+    total: int
+    processed: int = 0
+    validated: int = 0
+    rejected: int = 0
+    start_time: float = field(default_factory=time.time)
+
+    @property
+    def percent_complete(self) -> float:
+        """Percentage of batch processed."""
+        if self.total == 0:
+            return 100.0
+        return (self.processed / self.total) * 100
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Elapsed time in seconds."""
+        return time.time() - self.start_time
+
+    @property
+    def items_per_second(self) -> float:
+        """Processing rate."""
+        if self.elapsed_seconds == 0:
+            return 0.0
+        return self.processed / self.elapsed_seconds
+
+    @property
+    def eta_seconds(self) -> float:
+        """Estimated time remaining in seconds."""
+        if self.items_per_second == 0:
+            return 0.0
+        remaining = self.total - self.processed
+        return remaining / self.items_per_second
+
+    @property
+    def hallucination_rate(self) -> float:
+        """Current hallucination rate."""
+        total_attempted = self.validated + self.rejected
+        if total_attempted == 0:
+            return 0.0
+        return self.rejected / total_attempted
+
+
+@dataclass
+class BatchResult:
+    """Result from batch DDR retrieval."""
+    results: list[DDRResult]
+    total_validated: int
+    total_rejected: int
+    overall_hallucination_rate: float
+    duration_seconds: float
+    queries_processed: int
+
+    @property
+    def success(self) -> bool:
+        """Batch successful if Hall_m < 0.02."""
+        return self.overall_hallucination_rate < 0.02
+
+    @property
+    def all_elements(self) -> list[CodeElement]:
+        """All validated elements from all queries."""
+        elements = []
+        for result in self.results:
+            elements.extend(result.elements)
+        return elements
 
 
 class DirectDependencyRetriever:
@@ -495,8 +575,315 @@ class DirectDependencyRetriever:
             "target_hall_m": 0.02,
         }
 
+    # =========================================================================
+    # BATCH PROCESSING METHODS
+    # =========================================================================
 
-# Convenience function
+    def retrieve_batch(
+        self,
+        queries: list[str],
+        max_results_per_query: int = 20,
+        on_progress: Optional[Callable[[BatchProgress], None]] = None,
+        max_workers: int = 4,
+    ) -> BatchResult:
+        """Retrieve validated code elements for multiple queries in batch.
+
+        Processes ALL queries without artificial limits. Tracks progress
+        and calculates overall hallucination rate.
+
+        Args:
+            queries: List of search queries (concepts, symbols, etc.)
+            max_results_per_query: Max elements per query (None = unlimited)
+            on_progress: Optional callback for progress updates
+            max_workers: Number of parallel workers for validation
+
+        Returns:
+            BatchResult with all validated elements and metrics
+        """
+        start_time = time.time()
+        progress = BatchProgress(total=len(queries))
+
+        logger.info(f"Starting batch DDR retrieval for {len(queries)} queries")
+
+        results = []
+        total_validated = 0
+        total_rejected = 0
+
+        # Process queries - can be parallelized for large batches
+        for i, query in enumerate(queries):
+            result = self.retrieve(query, max_results_per_query)
+            results.append(result)
+
+            total_validated += result.validated_count
+            total_rejected += result.rejected_count
+
+            # Update progress
+            progress.processed = i + 1
+            progress.validated = total_validated
+            progress.rejected = total_rejected
+
+            # Callback for progress tracking
+            if on_progress:
+                on_progress(progress)
+
+            # Log progress every 10 queries or at completion
+            if (i + 1) % 10 == 0 or i + 1 == len(queries):
+                logger.info(
+                    f"Batch progress: {progress.percent_complete:.1f}% "
+                    f"({progress.processed}/{progress.total}) "
+                    f"Hall_m: {progress.hallucination_rate:.4f} "
+                    f"ETA: {progress.eta_seconds:.1f}s"
+                )
+
+        # Calculate overall metrics
+        total_attempted = total_validated + total_rejected
+        overall_hall_rate = total_rejected / total_attempted if total_attempted > 0 else 0.0
+        duration = time.time() - start_time
+
+        logger.info(
+            f"Batch complete: {len(queries)} queries, "
+            f"{total_validated} validated, {total_rejected} rejected, "
+            f"Hall_m: {overall_hall_rate:.4f}, "
+            f"Duration: {duration:.2f}s"
+        )
+
+        return BatchResult(
+            results=results,
+            total_validated=total_validated,
+            total_rejected=total_rejected,
+            overall_hallucination_rate=overall_hall_rate,
+            duration_seconds=duration,
+            queries_processed=len(queries),
+        )
+
+    def retrieve_batch_parallel(
+        self,
+        queries: list[str],
+        max_results_per_query: int = 20,
+        on_progress: Optional[Callable[[BatchProgress], None]] = None,
+        max_workers: int = 4,
+    ) -> BatchResult:
+        """Retrieve validated elements in parallel for efficiency.
+
+        Uses ThreadPoolExecutor for parallel query processing.
+        Best for large batches (100+ queries).
+
+        Args:
+            queries: List of search queries
+            max_results_per_query: Max elements per query
+            on_progress: Optional callback for progress updates
+            max_workers: Number of parallel workers
+
+        Returns:
+            BatchResult with all validated elements
+        """
+        start_time = time.time()
+        progress = BatchProgress(total=len(queries))
+
+        logger.info(
+            f"Starting parallel batch DDR retrieval: {len(queries)} queries, "
+            f"{max_workers} workers"
+        )
+
+        results = []
+        total_validated = 0
+        total_rejected = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all queries
+            future_to_query = {
+                executor.submit(self.retrieve, query, max_results_per_query): query
+                for query in queries
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_query):
+                query = future_to_query[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+
+                    total_validated += result.validated_count
+                    total_rejected += result.rejected_count
+
+                except Exception as e:
+                    logger.warning(f"Query failed: {query[:50]}... - {e}")
+                    # Add empty result for failed query
+                    results.append(DDRResult(
+                        query=query,
+                        elements=[],
+                        validated_count=0,
+                        rejected_count=0,
+                        hallucination_rate=0.0,
+                    ))
+
+                # Update progress
+                progress.processed += 1
+                progress.validated = total_validated
+                progress.rejected = total_rejected
+
+                if on_progress:
+                    on_progress(progress)
+
+        # Calculate metrics
+        total_attempted = total_validated + total_rejected
+        overall_hall_rate = total_rejected / total_attempted if total_attempted > 0 else 0.0
+        duration = time.time() - start_time
+
+        logger.info(
+            f"Parallel batch complete: {len(queries)} queries in {duration:.2f}s "
+            f"({len(queries)/duration:.1f} queries/sec)"
+        )
+
+        return BatchResult(
+            results=results,
+            total_validated=total_validated,
+            total_rejected=total_rejected,
+            overall_hallucination_rate=overall_hall_rate,
+            duration_seconds=duration,
+            queries_processed=len(queries),
+        )
+
+    def retrieve_all_proven_links(
+        self,
+        on_progress: Optional[Callable[[BatchProgress], None]] = None,
+    ) -> BatchResult:
+        """Retrieve ALL PROVEN links from KuzuDB without artificial limits.
+
+        This is the key method that removes the LIMIT 1/LIMIT 50 constraints
+        and processes all concepts in the database.
+
+        Args:
+            on_progress: Optional callback for progress updates
+
+        Returns:
+            BatchResult with all validated PROVEN links
+        """
+        from ..core.database import db
+
+        logger.info("Retrieving ALL PROVEN links (no LIMIT constraint)")
+
+        # Query ALL proven links - NO LIMIT!
+        try:
+            res = db.execute(
+                "MATCH (c:Concept)-[:PROVEN]->(s:Symbol) "
+                "RETURN c.name, s.name, s.file_path"
+            )
+
+            proven_links = []
+            while res.has_next():
+                row = res.get_next()
+                proven_links.append({
+                    'concept': row[0],
+                    'symbol': row[1],
+                    'file_path': row[2],
+                })
+
+            logger.info(f"Found {len(proven_links)} PROVEN links to process")
+
+        except Exception as e:
+            logger.error(f"Failed to query PROVEN links: {e}")
+            return BatchResult(
+                results=[],
+                total_validated=0,
+                total_rejected=0,
+                overall_hallucination_rate=0.0,
+                duration_seconds=0.0,
+                queries_processed=0,
+            )
+
+        if not proven_links:
+            logger.warning("No PROVEN links found in database")
+            return BatchResult(
+                results=[],
+                total_validated=0,
+                total_rejected=0,
+                overall_hallucination_rate=0.0,
+                duration_seconds=0.0,
+                queries_processed=0,
+            )
+
+        # Extract unique concept names as queries
+        concept_queries = list(set(link['concept'] for link in proven_links))
+        logger.info(f"Processing {len(concept_queries)} unique concepts")
+
+        # Process all concepts in batch
+        return self.retrieve_batch(
+            queries=concept_queries,
+            on_progress=on_progress,
+        )
+
+    def validate_batch(
+        self,
+        candidates: list[dict],
+        on_progress: Optional[Callable[[BatchProgress], None]] = None,
+    ) -> tuple[list[CodeElement], BatchProgress]:
+        """Validate a batch of symbol candidates.
+
+        Efficiently validates multiple candidates and tracks progress.
+
+        Args:
+            candidates: List of candidate dicts from symbol index
+            on_progress: Optional callback for progress updates
+
+        Returns:
+            Tuple of (validated elements, final progress)
+        """
+        progress = BatchProgress(total=len(candidates))
+        validated_elements = []
+
+        logger.info(f"Validating batch of {len(candidates)} candidates")
+
+        for i, candidate in enumerate(candidates):
+            element = self._validate_and_extract(candidate)
+
+            if element and element.is_valid:
+                validated_elements.append(element)
+                progress.validated += 1
+            else:
+                progress.rejected += 1
+
+            progress.processed = i + 1
+
+            if on_progress:
+                on_progress(progress)
+
+            # Log every 100 items
+            if (i + 1) % 100 == 0:
+                logger.debug(
+                    f"Validation progress: {progress.percent_complete:.1f}% "
+                    f"Hall_m: {progress.hallucination_rate:.4f}"
+                )
+
+        logger.info(
+            f"Batch validation complete: {progress.validated}/{progress.total} valid "
+            f"(Hall_m: {progress.hallucination_rate:.4f})"
+        )
+
+        return validated_elements, progress
+
+    def iter_retrieve(
+        self,
+        queries: list[str],
+        max_results_per_query: int = 20,
+    ) -> Iterator[tuple[str, DDRResult]]:
+        """Iterator for batch retrieval - memory efficient for large batches.
+
+        Yields results one at a time instead of collecting all in memory.
+
+        Args:
+            queries: List of search queries
+            max_results_per_query: Max elements per query
+
+        Yields:
+            Tuples of (query, DDRResult)
+        """
+        for query in queries:
+            result = self.retrieve(query, max_results_per_query)
+            yield query, result
+
+
+# Convenience functions
 def retrieve_validated(
     query: str,
     codewiki_path: Path,
@@ -516,3 +903,67 @@ def retrieve_validated(
     """
     ddr = DirectDependencyRetriever(codewiki_path, repo_path)
     return ddr.retrieve(query, max_results)
+
+
+def retrieve_batch_validated(
+    queries: list[str],
+    codewiki_path: Path,
+    repo_path: Optional[Path] = None,
+    max_results_per_query: int = 20,
+    on_progress: Optional[Callable[[BatchProgress], None]] = None,
+    parallel: bool = False,
+    max_workers: int = 4,
+) -> BatchResult:
+    """Retrieve validated code elements for multiple queries.
+
+    Batch version that processes ALL queries without artificial limits.
+
+    Args:
+        queries: List of search queries
+        codewiki_path: Path to CodeWiki output directory
+        repo_path: Optional path to actual repository
+        max_results_per_query: Maximum elements per query
+        on_progress: Optional callback for progress updates
+        parallel: Use parallel processing (for 100+ queries)
+        max_workers: Number of parallel workers
+
+    Returns:
+        BatchResult with all validated elements
+    """
+    ddr = DirectDependencyRetriever(codewiki_path, repo_path)
+
+    if parallel and len(queries) > 50:
+        return ddr.retrieve_batch_parallel(
+            queries,
+            max_results_per_query,
+            on_progress,
+            max_workers,
+        )
+    else:
+        return ddr.retrieve_batch(
+            queries,
+            max_results_per_query,
+            on_progress,
+        )
+
+
+def retrieve_all_proven_links(
+    codewiki_path: Path,
+    repo_path: Optional[Path] = None,
+    on_progress: Optional[Callable[[BatchProgress], None]] = None,
+) -> BatchResult:
+    """Retrieve ALL PROVEN links without any LIMIT constraints.
+
+    This is the main entry point for batch concept processing
+    that removes the LIMIT 1/LIMIT 50 constraints.
+
+    Args:
+        codewiki_path: Path to CodeWiki output directory
+        repo_path: Optional path to actual repository
+        on_progress: Optional callback for progress updates
+
+    Returns:
+        BatchResult with all validated PROVEN links
+    """
+    ddr = DirectDependencyRetriever(codewiki_path, repo_path)
+    return ddr.retrieve_all_proven_links(on_progress)

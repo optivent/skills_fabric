@@ -248,23 +248,25 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
         """Run linking stage."""
         state.stage = WorkflowStage.LINKING
 
-        # Get concepts from database
+        # Get ALL concepts from database - NO LIMIT constraint
         from ..core.database import db
         try:
-            res = db.execute("MATCH (c:Concept) RETURN c.name, c.content LIMIT 100")
+            res = db.execute("MATCH (c:Concept) RETURN c.name, c.content")
             concepts = []
             while res.has_next():
                 row = res.get_next()
                 concepts.append({'name': row[0], 'content': row[1] or ''})
+            print(f"  Loaded {len(concepts)} concepts from database")
         except Exception:
             concepts = []
 
         if not concepts:
-            # Create concepts from mined symbols
+            # Create concepts from ALL mined symbols - NO [:50] LIMIT
             concepts = [
                 {'name': s['name'], 'content': s.get('signature', '')}
-                for s in state.mined_symbols[:50]
+                for s in state.mined_symbols
             ]
+            print(f"  Created {len(concepts)} concepts from mined symbols")
 
         task = LinkingTask(
             concepts=concepts,
@@ -287,10 +289,14 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
         """Run writing stage."""
         state.stage = WorkflowStage.WRITING
 
-        # Generate skills from proven links and snippets
+        # Generate skills from ALL proven links - NO [:20] LIMIT
         skills = []
+        proven_links = state.proven_links
+        total_links = len(proven_links)
 
-        for link in state.proven_links[:20]:
+        print(f"  Processing ALL {total_links} proven links for skill generation...")
+
+        for i, link in enumerate(proven_links):
             # Find matching snippet
             symbol_name = link.get('symbol_name', '')
             file_path = link.get('file_path', '')
@@ -315,8 +321,12 @@ class SupervisorAgent(BaseAgent[SupervisorResult]):
             if result.success:
                 skills.append(result.output.skill)
 
+            # Progress update for large batches
+            if (i + 1) % 50 == 0 or i + 1 == total_links:
+                print(f"    Writing progress: {i + 1}/{total_links} ({len(skills)} skills created)")
+
         state.skills = skills
-        print(f"  Generated {len(skills)} skills")
+        print(f"  Generated {len(skills)} skills from ALL {total_links} proven links")
 
         # Return last result (or create summary)
         return state, AgentResult(
