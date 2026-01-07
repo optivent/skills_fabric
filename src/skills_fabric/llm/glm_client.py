@@ -15,7 +15,9 @@ Features:
 - thinking_budget parameter for controlling reasoning token limits
 - Thinking metrics tracking and logging
 - Reasoning fallback: automatic retry without thinking when reasoning fails
-- Streaming support
+- Async streaming support for long-running code analysis
+- Proper token counting during streams
+- Graceful stream interruption handling
 - Cost tracking (Coding Plan: reduced rates)
 
 Usage:
@@ -54,6 +56,38 @@ Usage:
     agent = GLMCodingAgent(thinking_budget=24000)
     response = agent.send("Explain this function")
     print(agent.get_thinking_usage())
+
+    # Async streaming for long-running code analysis
+    import asyncio
+
+    async def stream_analysis():
+        async for chunk in client.generate_stream_async(messages):
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
+            if chunk.is_final:
+                print(f"\\n\\nTokens: {chunk.completion_tokens}")
+                if chunk.interrupted:
+                    print(f"Stream interrupted: {chunk.interruption_type.value}")
+
+    asyncio.run(stream_analysis())
+
+    # Convenience method for streaming code analysis
+    async def analyze_code():
+        def on_chunk(chunk):
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
+
+        response, stats = await client.stream_code_analysis(
+            code=source_code,
+            language="python",
+            analysis_type="comprehensive",  # or "security", "performance"
+            on_chunk=on_chunk
+        )
+        print(f"\\n\\nAnalysis completed in {stats.total_duration_ms:.0f}ms")
+        print(f"Time to first token: {stats.time_to_first_token_ms:.0f}ms")
+        print(f"Tokens/sec: {stats.tokens_per_second:.1f}")
+
+    asyncio.run(analyze_code())
 """
 from dataclasses import dataclass, field
 from typing import Optional, Iterator, Any, AsyncIterator, Union
@@ -856,10 +890,556 @@ class GLMClient:
         )
 
     def _parse_stream(self, response: Any, latency_ms: float) -> Iterator[str]:
-        """Parse streaming response."""
+        """Parse streaming response (sync version).
+
+        Note: For better streaming support, use generate_stream_async().
+        """
         # Streaming implementation would go here
         # For now, yield the full response
         yield response.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    # =========================================================================
+    # Async Streaming Support
+    # =========================================================================
+
+    async def generate_stream_async(
+        self,
+        messages: list[dict],
+        thinking: bool = True,
+        preserve_thinking: bool = False,
+        thinking_budget: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> AsyncIterator[StreamChunk]:
+        """Generate a streaming response from GLM-4.7 asynchronously.
+
+        Yields StreamChunk objects as they arrive, with proper token counting
+        and interruption handling.
+
+        Args:
+            messages: List of messages in OpenAI format
+            thinking: Enable thinking mode
+            preserve_thinking: Keep thinking across turns (for agents)
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
+            max_tokens: Override max tokens
+            temperature: Override temperature
+            timeout: Timeout for the streaming connection (default: config.timeout)
+            **kwargs: Additional parameters
+
+        Yields:
+            StreamChunk objects containing content, thinking, and metadata
+
+        Raises:
+            RuntimeError: If httpx is not available
+
+        Example:
+            async for chunk in client.generate_stream_async(messages):
+                if chunk.content:
+                    print(chunk.content, end="", flush=True)
+                if chunk.is_final:
+                    print(f"\\nTokens: {chunk.completion_tokens}")
+        """
+        if not HTTPX_AVAILABLE:
+            raise RuntimeError(
+                "Async streaming requires httpx. Install it with: pip install httpx"
+            )
+
+        # Build request payload
+        budget = thinking_budget or self.config.thinking_budget
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "max_tokens": max_tokens or self.config.max_tokens,
+            "temperature": temperature or self.config.temperature,
+            "top_p": self.config.top_p,
+            "stream": True,  # Enable streaming
+        }
+
+        # Configure thinking mode with budget_tokens (Z.ai format)
+        if thinking:
+            if preserve_thinking:
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
+                payload["chat_template_kwargs"] = {
+                    "enable_thinking": True,
+                    "clear_thinking": False,
+                }
+            else:
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
+        else:
+            payload["thinking"] = {"type": "disabled"}
+
+        # Add any extra parameters
+        payload.update(kwargs)
+
+        # Initialize stats
+        stats = StreamingStats(start_time=time.time())
+        chunk_index = 0
+        accumulated_content = ""
+        accumulated_thinking = ""
+        stream_timeout = timeout or self.config.timeout
+
+        try:
+            async with httpx.AsyncClient(timeout=stream_timeout) as client:
+                async with client.stream(
+                    "POST",
+                    self.endpoint,
+                    headers=self.headers,
+                    json=payload,
+                ) as response:
+                    # Check for HTTP errors
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        error_msg = f"HTTP {response.status_code}: {error_text.decode()}"
+                        logger.error(f"Stream request failed: {error_msg}")
+                        yield StreamChunk(
+                            interrupted=True,
+                            interruption_type=StreamInterruptionType.SERVER_ERROR,
+                            error_message=error_msg,
+                            is_final=True,
+                        )
+                        return
+
+                    # Process SSE stream
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+
+                        # Parse SSE event
+                        chunk = self._parse_sse_line(
+                            line,
+                            chunk_index,
+                            stats,
+                            accumulated_content,
+                            accumulated_thinking,
+                            thinking_budget=budget if thinking else 0,
+                        )
+
+                        if chunk is None:
+                            continue
+
+                        # Update stats
+                        if chunk_index == 0 and stats.first_chunk_time == 0:
+                            stats.first_chunk_time = time.time()
+
+                        if chunk.content:
+                            accumulated_content += chunk.content
+                            stats.content_length += len(chunk.content)
+
+                        if chunk.thinking:
+                            accumulated_thinking += chunk.thinking
+                            stats.thinking_length += len(chunk.thinking)
+
+                        chunk_index += 1
+                        stats.total_chunks = chunk_index
+
+                        yield chunk
+
+                        # Check for final chunk
+                        if chunk.is_final:
+                            stats.end_time = time.time()
+                            stats.prompt_tokens = chunk.prompt_tokens
+                            stats.completion_tokens = chunk.completion_tokens
+                            stats.thinking_tokens = chunk.thinking_tokens
+                            self._log_streaming_stats(stats)
+                            return
+
+        except asyncio.CancelledError:
+            # Client cancelled the stream
+            logger.info("Stream cancelled by client")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.CLIENT_CANCELLED
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.CLIENT_CANCELLED,
+                is_final=True,
+            )
+
+        except httpx.TimeoutException as e:
+            logger.error(f"Stream timeout: {e}")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.TIMEOUT
+            stats.error_message = str(e)
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.TIMEOUT,
+                error_message=str(e),
+                is_final=True,
+            )
+
+        except httpx.HTTPError as e:
+            logger.error(f"Stream connection error: {e}")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.CONNECTION_ERROR
+            stats.error_message = str(e)
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.CONNECTION_ERROR,
+                error_message=str(e),
+                is_final=True,
+            )
+
+        except Exception as e:
+            logger.error(f"Unexpected stream error: {e}")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.SERVER_ERROR
+            stats.error_message = str(e)
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.SERVER_ERROR,
+                error_message=str(e),
+                is_final=True,
+            )
+
+    def _parse_sse_line(
+        self,
+        line: str,
+        chunk_index: int,
+        stats: StreamingStats,
+        accumulated_content: str,
+        accumulated_thinking: str,
+        thinking_budget: int = 0,
+    ) -> Optional[StreamChunk]:
+        """Parse a single SSE line from the stream.
+
+        Args:
+            line: Raw SSE line (e.g., "data: {...}")
+            chunk_index: Current chunk index
+            stats: Streaming stats to update
+            accumulated_content: Content accumulated so far
+            accumulated_thinking: Thinking accumulated so far
+            thinking_budget: The thinking budget used for this request
+
+        Returns:
+            StreamChunk if the line contains valid data, None otherwise
+        """
+        # SSE format: "data: {json}" or "data: [DONE]"
+        if not line.startswith("data:"):
+            return None
+
+        data_str = line[5:].strip()
+
+        # Check for stream end marker
+        if data_str == "[DONE]":
+            return StreamChunk(
+                content="",
+                thinking="",
+                finish_reason="stop",
+                is_final=True,
+                chunk_index=chunk_index,
+                prompt_tokens=stats.prompt_tokens,
+                completion_tokens=stats.completion_tokens,
+                thinking_tokens=stats.thinking_tokens,
+            )
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse SSE data: {e}")
+            return StreamChunk(
+                interrupted=True,
+                interruption_type=StreamInterruptionType.MALFORMED_DATA,
+                error_message=f"JSON decode error: {e}",
+                chunk_index=chunk_index,
+            )
+
+        # Extract content from the chunk
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        finish_reason = choice.get("finish_reason")
+
+        content = delta.get("content", "")
+        thinking = delta.get("thinking", "") or delta.get("reasoning_content", "")
+
+        # Update token counts from usage if available (usually in final chunk)
+        usage = data.get("usage", {})
+        if usage:
+            stats.prompt_tokens = usage.get("prompt_tokens", stats.prompt_tokens)
+            stats.completion_tokens = usage.get("completion_tokens", stats.completion_tokens)
+            stats.thinking_tokens = usage.get("thinking_tokens", stats.thinking_tokens)
+
+        # Calculate timing
+        latency_ms = 0.0
+        if stats.start_time > 0:
+            latency_ms = (time.time() - stats.start_time) * 1000
+
+        return StreamChunk(
+            content=content,
+            thinking=thinking,
+            finish_reason=finish_reason,
+            is_final=finish_reason is not None,
+            chunk_index=chunk_index,
+            prompt_tokens=stats.prompt_tokens,
+            completion_tokens=stats.completion_tokens,
+            thinking_tokens=stats.thinking_tokens,
+            latency_ms=latency_ms,
+        )
+
+    def _log_streaming_stats(self, stats: StreamingStats) -> None:
+        """Log streaming statistics."""
+        metrics = stats.to_dict()
+        if stats.interrupted:
+            logger.warning(f"Stream interrupted: {metrics}")
+        else:
+            logger.debug(f"Stream completed: {metrics}")
+
+    async def stream_code_analysis(
+        self,
+        code: str,
+        language: str = "python",
+        analysis_type: str = "comprehensive",
+        thinking_budget: Optional[int] = None,
+        timeout: Optional[float] = None,
+        on_chunk: Optional[callable] = None,
+    ) -> tuple[GLMResponse, StreamingStats]:
+        """Stream code analysis for long-running analysis tasks.
+
+        This is a convenience method for streaming code analysis with
+        automatic content accumulation and optional chunk callbacks.
+
+        Args:
+            code: The source code to analyze
+            language: Programming language of the code
+            analysis_type: Type of analysis ("comprehensive", "security", "performance")
+            thinking_budget: Max reasoning tokens (default: 32000 for analysis)
+            timeout: Timeout for the analysis (default: 300 seconds for long analysis)
+            on_chunk: Optional callback called for each chunk: on_chunk(chunk: StreamChunk)
+
+        Returns:
+            Tuple of (GLMResponse with complete analysis, StreamingStats)
+
+        Example:
+            async def print_progress(chunk):
+                if chunk.content:
+                    print(chunk.content, end="", flush=True)
+
+            response, stats = await client.stream_code_analysis(
+                code=source_code,
+                language="python",
+                on_chunk=print_progress
+            )
+            print(f"\\n\\nAnalysis took {stats.total_duration_ms:.0f}ms")
+        """
+        # Use higher defaults for long-running analysis
+        budget = thinking_budget or 32000
+        stream_timeout = timeout or 300.0  # 5 minutes for comprehensive analysis
+
+        # Build analysis prompt based on type
+        analysis_prompts = {
+            "comprehensive": """Provide a comprehensive code analysis including:
+1. Overall architecture and design patterns
+2. Function-by-function breakdown
+3. Data flow analysis
+4. Error handling assessment
+5. Performance considerations
+6. Security implications
+7. Recommendations for improvement""",
+            "security": """Perform a security-focused code analysis:
+1. Identify potential security vulnerabilities
+2. Check for injection risks (SQL, XSS, command injection)
+3. Assess authentication and authorization patterns
+4. Review sensitive data handling
+5. Check for hardcoded secrets or credentials
+6. Evaluate input validation
+7. Provide remediation recommendations""",
+            "performance": """Analyze code performance:
+1. Identify algorithmic complexity issues
+2. Find potential memory leaks
+3. Detect unnecessary computations
+4. Review database query patterns
+5. Assess caching opportunities
+6. Identify blocking operations
+7. Suggest optimizations with benchmarks""",
+        }
+
+        instruction = analysis_prompts.get(analysis_type, analysis_prompts["comprehensive"])
+
+        system_prompt = f"""You are an expert code analyst specializing in {language}.
+Perform a thorough analysis of the provided code.
+Use your reasoning capabilities to understand the code deeply.
+{instruction}"""
+
+        user_message = f"""Analyze this {language} code:
+
+```{language}
+{code}
+```"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        # Collect streamed response
+        accumulated_content = ""
+        accumulated_thinking = ""
+        final_stats = StreamingStats()
+        final_usage = TokenUsage()
+        finish_reason = "stop"
+        interrupted = False
+        interruption_type = StreamInterruptionType.NONE
+        error_message = None
+
+        logger.info(
+            f"Starting streaming code analysis: language={language}, "
+            f"type={analysis_type}, budget={budget}, timeout={stream_timeout}s"
+        )
+
+        async for chunk in self.generate_stream_async(
+            messages=messages,
+            thinking=True,
+            thinking_budget=budget,
+            timeout=stream_timeout,
+        ):
+            # Call user callback if provided
+            if on_chunk:
+                try:
+                    on_chunk(chunk)
+                except Exception as e:
+                    logger.warning(f"on_chunk callback error: {e}")
+
+            # Accumulate content
+            if chunk.content:
+                accumulated_content += chunk.content
+            if chunk.thinking:
+                accumulated_thinking += chunk.thinking
+
+            # Update stats and check for completion
+            if chunk.is_final:
+                final_usage = TokenUsage(
+                    prompt_tokens=chunk.prompt_tokens,
+                    completion_tokens=chunk.completion_tokens,
+                    thinking_tokens=chunk.thinking_tokens,
+                    total_tokens=chunk.prompt_tokens + chunk.completion_tokens + chunk.thinking_tokens,
+                    thinking_budget=budget,
+                )
+                finish_reason = chunk.finish_reason or "stop"
+                interrupted = chunk.interrupted
+                interruption_type = chunk.interruption_type
+                error_message = chunk.error_message
+
+        # Build final response
+        response = GLMResponse(
+            content=accumulated_content,
+            thinking=accumulated_thinking if accumulated_thinking else None,
+            finish_reason=finish_reason,
+            usage=final_usage,
+            model=self.config.model,
+            latency_ms=final_stats.total_duration_ms,
+        )
+
+        # Build final stats
+        final_stats.content_length = len(accumulated_content)
+        final_stats.thinking_length = len(accumulated_thinking)
+        final_stats.prompt_tokens = final_usage.prompt_tokens
+        final_stats.completion_tokens = final_usage.completion_tokens
+        final_stats.thinking_tokens = final_usage.thinking_tokens
+        final_stats.interrupted = interrupted
+        final_stats.interruption_type = interruption_type
+        final_stats.error_message = error_message
+
+        logger.info(
+            f"Code analysis complete: tokens={final_usage.total_tokens}, "
+            f"duration={final_stats.total_duration_ms:.0f}ms, interrupted={interrupted}"
+        )
+
+        return response, final_stats
+
+    async def collect_stream(
+        self,
+        messages: list[dict],
+        thinking: bool = True,
+        thinking_budget: Optional[int] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> GLMResponse:
+        """Collect a streaming response into a single GLMResponse.
+
+        This is useful when you want async streaming behavior (for timeouts
+        and cancellation) but don't need to process chunks individually.
+
+        Args:
+            messages: List of messages in OpenAI format
+            thinking: Enable thinking mode
+            thinking_budget: Max tokens for reasoning
+            timeout: Timeout for the streaming connection
+            **kwargs: Additional parameters passed to generate_stream_async
+
+        Returns:
+            GLMResponse with accumulated content
+        """
+        accumulated_content = ""
+        accumulated_thinking = ""
+        final_usage = TokenUsage()
+        finish_reason = "stop"
+        start_time = time.time()
+
+        async for chunk in self.generate_stream_async(
+            messages=messages,
+            thinking=thinking,
+            thinking_budget=thinking_budget,
+            timeout=timeout,
+            **kwargs,
+        ):
+            if chunk.content:
+                accumulated_content += chunk.content
+            if chunk.thinking:
+                accumulated_thinking += chunk.thinking
+
+            if chunk.is_final:
+                budget = thinking_budget or self.config.thinking_budget
+                final_usage = TokenUsage(
+                    prompt_tokens=chunk.prompt_tokens,
+                    completion_tokens=chunk.completion_tokens,
+                    thinking_tokens=chunk.thinking_tokens,
+                    total_tokens=chunk.prompt_tokens + chunk.completion_tokens + chunk.thinking_tokens,
+                    thinking_budget=budget if thinking else 0,
+                )
+                finish_reason = chunk.finish_reason or "stop"
+
+                if chunk.interrupted:
+                    logger.warning(
+                        f"Stream interrupted: {chunk.interruption_type.value} - "
+                        f"{chunk.error_message or 'No details'}"
+                    )
+
+        latency_ms = (time.time() - start_time) * 1000
+
+        return GLMResponse(
+            content=accumulated_content,
+            thinking=accumulated_thinking if accumulated_thinking else None,
+            finish_reason=finish_reason,
+            usage=final_usage,
+            model=self.config.model,
+            latency_ms=latency_ms,
+        )
 
     def chat(
         self,

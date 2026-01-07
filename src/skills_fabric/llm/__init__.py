@@ -8,6 +8,8 @@ Features:
 - Thinking/reasoning mode with budget control
 - Automatic fallback to non-thinking mode on failures
 - Reasoning metrics tracking
+- Async streaming for long-running code analysis
+- Stream interruption handling
 """
 from .glm_client import (
     GLMClient,
@@ -19,6 +21,10 @@ from .glm_client import (
     TokenUsage,
     ReasoningFailureType,
     ReasoningMetrics,
+    # Streaming support
+    StreamChunk,
+    StreamingStats,
+    StreamInterruptionType,
 )
 
 __all__ = [
@@ -31,4 +37,8 @@ __all__ = [
     'TokenUsage',
     'ReasoningFailureType',
     'ReasoningMetrics',
+    # Streaming support
+    'StreamChunk',
+    'StreamingStats',
+    'StreamInterruptionType',
 ]
