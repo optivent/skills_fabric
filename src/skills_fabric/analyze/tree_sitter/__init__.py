@@ -4,9 +4,15 @@ Supports Python, TypeScript, JavaScript, and JSX parsing with graceful
 error handling. All parse errors are logged rather than raising exceptions.
 
 Usage:
+    from skills_fabric.analyze.tree_sitter import TreeSitterParser, TSSymbol
+
     parser = TreeSitterParser()
     symbols = parser.parse_file(Path("example.py"))
     # Returns list of TSSymbol with name, kind, file_path, line
+
+CLI Usage:
+    python -m skills_fabric.analyze.tree_sitter --file example.py
+    python -m skills_fabric.analyze.tree_sitter --directory src/
 """
 from pathlib import Path
 from dataclasses import dataclass
@@ -15,6 +21,8 @@ from typing import Optional
 from skills_fabric.observability.logging import get_logger
 
 logger = get_logger("analyze.tree_sitter")
+
+__all__ = ["TSSymbol", "TreeSitterParser"]
 
 
 @dataclass
