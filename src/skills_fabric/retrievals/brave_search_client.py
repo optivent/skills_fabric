@@ -67,7 +67,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, ClassVar
 from enum import Enum
 from urllib.parse import urlparse
 
@@ -147,7 +147,7 @@ class DomainAuthority:
     is_primary_source: bool = False  # Official docs, original sources
 
     # Known high-authority domains for technical content
-    AUTHORITY_SCORES: dict[str, tuple[str, float, bool]] = {
+    AUTHORITY_SCORES: ClassVar[dict[str, tuple[str, float, bool]]] = {
         # Official documentation (highest trust)
         "docs.python.org": ("official", 0.98, True),
         "langchain.com": ("official", 0.95, True),

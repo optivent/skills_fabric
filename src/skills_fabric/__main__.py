@@ -552,7 +552,7 @@ def cmd_research(args: argparse.Namespace) -> int:
                     max_depth=args.depth,
                 )
             else:
-                return await client.research(query)
+                return await client.search(query)
 
         result = asyncio.run(run_research())
 

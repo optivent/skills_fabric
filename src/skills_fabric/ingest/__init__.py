@@ -48,8 +48,8 @@ from .context7 import (
     LibraryResolutionStatus,
     LibraryResolutionResult,
 )
-from .exa_search import ExaSearchClient
-from .fusion import MultiSourceFusion
+from .exa_search import ExaClient
+from .fusion import SourceFusion
 
 __all__ = [
     # Git Clone
@@ -73,7 +73,7 @@ __all__ = [
     "LibraryResolutionStatus",
     "LibraryResolutionResult",
     # Exa Search
-    "ExaSearchClient",
+    "ExaClient",
     # Fusion
-    "MultiSourceFusion",
+    "SourceFusion",
 ]

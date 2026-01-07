@@ -12,6 +12,7 @@ as specified in the Language Server Protocol specification.
 import subprocess
 import json
 import os
+import sys
 import threading
 import queue
 from pathlib import Path
@@ -375,7 +376,8 @@ class LSPClient:
 
         try:
             if language == "python":
-                cmd = ["pylsp"]
+                # Use the same Python interpreter to run pylsp module
+                cmd = [sys.executable, "-m", "pylsp"]
             elif language == "typescript":
                 cmd = ["typescript-language-server", "--stdio"]
             else:
