@@ -6,9 +6,22 @@ This module provides fixtures for:
 - Verification tools (DDR, HallMetric, MultiSourceValidator)
 - Utility fixtures (temp files, sample code)
 
+Test Markers:
+- @pytest.mark.unit: Fast unit tests with no external dependencies
+- @pytest.mark.integration: Integration tests that may need external services
+- @pytest.mark.slow: Slow-running tests
+- @pytest.mark.requires_api: Tests requiring real API keys
+- @pytest.mark.lsp: Tests requiring LSP server
+
 Usage:
+    @pytest.mark.unit
     def test_something(mock_glm_client, sample_python_file):
         # Use fixtures in your tests
+        pass
+
+    @pytest.mark.integration
+    def test_full_flow(sample_project_dir):
+        # Integration test
         pass
 """
 from __future__ import annotations
@@ -22,6 +35,40 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+# =============================================================================
+# Pytest Configuration Hooks
+# =============================================================================
+
+def pytest_configure(config):
+    """Configure pytest markers."""
+    config.addinivalue_line(
+        "markers", "unit: mark test as unit test (fast, no external deps)"
+    )
+    config.addinivalue_line(
+        "markers", "integration: mark test as integration test"
+    )
+    config.addinivalue_line(
+        "markers", "slow: mark test as slow running"
+    )
+    config.addinivalue_line(
+        "markers", "requires_api: mark test as requiring live API calls"
+    )
+    config.addinivalue_line(
+        "markers", "lsp: mark test as requiring LSP server"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-mark tests based on their location."""
+    for item in items:
+        # Mark integration tests automatically based on path
+        if "integration" in str(item.fspath):
+            item.add_marker(pytest.mark.integration)
+        # Mark unit tests if in root tests/ but not integration/
+        elif "tests" in str(item.fspath) and "integration" not in str(item.fspath):
+            item.add_marker(pytest.mark.unit)
 
 
 # =============================================================================
