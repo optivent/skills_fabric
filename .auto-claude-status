@@ -3,23 +3,23 @@
   "spec": "001-i-need-to-have-the-best-possible-claude-skills-wit",
   "state": "building",
   "subtasks": {
-    "completed": 29,
+    "completed": 31,
     "total": 32,
     "in_progress": 1,
     "failed": 0
   },
   "phase": {
-    "current": "BMAD v6 Testing Strategy",
+    "current": "CLI and Entry Points",
     "id": null,
-    "total": 7
+    "total": 2
   },
   "workers": {
     "active": 0,
     "max": 1
   },
   "session": {
-    "number": 29,
-    "started_at": "2026-01-07T08:45:41.708799"
+    "number": 2,
+    "started_at": "2026-01-07T12:00:35.149846"
   },
-  "last_update": "2026-01-07T11:15:27.527362"
+  "last_update": "2026-01-07T12:03:09.061129"
 }
