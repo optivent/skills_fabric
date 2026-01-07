@@ -40,7 +40,7 @@ import json
 import time
 from datetime import datetime
 
-from ..observability.logging import get_logger
+from skills_fabric.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
