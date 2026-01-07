@@ -6,6 +6,25 @@ This module provides a comprehensive Context7 MCP API client with:
 - Proper error handling with retry logic
 - Progress tracking for large operations
 
+SPEC REQUIREMENT: Always call get-library-docs after successful resolve-library-id.
+Use resolve_and_fetch_docs() or resolve_and_fetch_docs_simple() for automatic chaining.
+
+RECOMMENDED PATTERN:
+    # Single query - returns (resolution, docs)
+    client = Context7Client()
+    resolution, docs = client.resolve_and_fetch_docs("langgraph", "getting started")
+    if resolution.is_success and docs:
+        print(docs)
+
+    # Simple version - returns just docs
+    docs = client.resolve_and_fetch_docs_simple("langgraph", "StateGraph")
+
+    # Multiple queries - resolves once, fetches all
+    results = client.get_docs_for_multiple_queries(
+        "langgraph",
+        ["getting started", "StateGraph", "nodes and edges"]
+    )
+
 BMAD C.O.R.E. Principles:
 - Collaboration: Fetches ALL available documentation (no arbitrary [:3] limits)
 - Optimized: Batch processing with efficient caching
@@ -36,6 +55,17 @@ class FetchStatus(Enum):
     CACHED = "cached"
     NOT_FOUND = "not_found"
     RATE_LIMITED = "rate_limited"
+    LIBRARY_NOT_FOUND = "library_not_found"  # Library couldn't be resolved in Context7
+
+
+class LibraryResolutionStatus(Enum):
+    """Status of a library resolution operation."""
+    RESOLVED = "resolved"  # Successfully resolved to a library ID
+    NOT_FOUND = "not_found"  # Library not found in Context7
+    EMPTY_RESULTS = "empty_results"  # API returned empty/no results
+    API_ERROR = "api_error"  # API returned an error
+    INVALID_RESPONSE = "invalid_response"  # Response couldn't be parsed
+    CACHED = "cached"  # Retrieved from cache
 
 
 @dataclass
@@ -75,6 +105,7 @@ class FetchProgress:
     successful: int = 0
     failed: int = 0
     cached: int = 0
+    library_not_found: int = 0  # Track library resolution failures separately
 
     @property
     def percent(self) -> float:
@@ -85,6 +116,11 @@ class FetchProgress:
     def is_complete(self) -> bool:
         """Check if all items processed."""
         return self.completed >= self.total
+
+    @property
+    def all_library_not_found(self) -> bool:
+        """Check if all failures were due to library not found (graceful failure)."""
+        return self.library_not_found > 0 and self.failed == 0
 
 
 @dataclass
@@ -97,6 +133,52 @@ class FetchResult:
     cache_file: Optional[Path] = None
     error: Optional[str] = None
     duration_ms: float = 0.0
+
+
+@dataclass
+class LibraryResolutionResult:
+    """Result of a library resolution operation.
+
+    Provides detailed information about library resolution attempts,
+    enabling graceful fallback handling when libraries aren't found.
+    """
+    library_name: str
+    status: LibraryResolutionStatus
+    library_id: Optional[str] = None
+    query: str = "documentation"
+    message: Optional[str] = None
+    raw_response: Optional[str] = None  # For debugging
+
+    @property
+    def is_success(self) -> bool:
+        """Check if resolution was successful."""
+        return self.status in (LibraryResolutionStatus.RESOLVED, LibraryResolutionStatus.CACHED)
+
+    @property
+    def is_not_found(self) -> bool:
+        """Check if library was not found (vs other errors)."""
+        return self.status in (
+            LibraryResolutionStatus.NOT_FOUND,
+            LibraryResolutionStatus.EMPTY_RESULTS
+        )
+
+    @property
+    def is_error(self) -> bool:
+        """Check if resolution failed due to an error."""
+        return self.status in (
+            LibraryResolutionStatus.API_ERROR,
+            LibraryResolutionStatus.INVALID_RESPONSE
+        )
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary."""
+        return {
+            "library_name": self.library_name,
+            "status": self.status.value,
+            "library_id": self.library_id,
+            "query": self.query,
+            "message": self.message,
+        }
 
 
 @dataclass
@@ -116,6 +198,33 @@ class BatchFetchResult:
         if not self.results:
             return 0.0
         return self.progress.successful / len(self.results)
+
+    @property
+    def is_library_not_found(self) -> bool:
+        """Check if all results indicate library not found.
+
+        This is useful for graceful fallback handling - when a library
+        isn't in Context7, we return an empty result set instead of an error.
+        """
+        return (
+            self.progress.library_not_found > 0 and
+            self.progress.successful == 0 and
+            self.progress.cached == 0
+        )
+
+    @property
+    def has_any_results(self) -> bool:
+        """Check if any documents were successfully fetched."""
+        return len(self.docs) > 0
+
+    def get_library_not_found_message(self) -> Optional[str]:
+        """Get a human-readable message if library was not found."""
+        if not self.is_library_not_found:
+            return None
+
+        # Get the library name from the first result
+        library_name = self.results[0].library_name if self.results else "unknown"
+        return f"Library '{library_name}' is not available in Context7. This is expected for libraries not in the Context7 index."
 
 
 class Context7Client:
@@ -267,19 +376,22 @@ class Context7Client:
         logger.error(f"Failed {operation} after {self.max_retries} attempts: {last_error}")
         return None
 
-    def resolve_library_id(
+    def resolve_library_id_detailed(
         self,
         library_name: str,
         query: str = "documentation"
-    ) -> Optional[str]:
-        """Resolve a library name to a Context7 library ID.
+    ) -> LibraryResolutionResult:
+        """Resolve a library name to a Context7 library ID with detailed status.
+
+        This method provides detailed information about the resolution attempt,
+        enabling graceful fallback handling when libraries aren't found.
 
         Args:
             library_name: Name of the library (e.g., "langgraph")
             query: Query hint for resolution
 
         Returns:
-            Library ID (e.g., "/langchain-ai/langgraph") or None if not found
+            LibraryResolutionResult with status and library_id (if found)
         """
         # Check cache first
         cache_key = f"{library_name}:{query}"
@@ -288,7 +400,21 @@ class Context7Client:
             if cached is not None:
                 self._stats["cache_hits"] += 1
                 logger.debug(f"Library ID cache hit: {library_name} -> {cached}")
-            return cached
+                return LibraryResolutionResult(
+                    library_name=library_name,
+                    status=LibraryResolutionStatus.CACHED,
+                    library_id=cached,
+                    query=query,
+                    message="Retrieved from cache"
+                )
+            else:
+                # Cached "not found" result
+                return LibraryResolutionResult(
+                    library_name=library_name,
+                    status=LibraryResolutionStatus.NOT_FOUND,
+                    query=query,
+                    message="Library not found (cached result)"
+                )
 
         payload = {
             "jsonrpc": "2.0",
@@ -302,23 +428,150 @@ class Context7Client:
 
         data = self._request_with_retry(payload, f"resolve-library-id({library_name})")
 
-        if data and "result" in data:
-            try:
-                text = data["result"]["content"][0]["text"]
-                # Extract library ID from response
-                match = re.search(r"/[\w-]+/[\w-]+", text)
-                if match:
-                    lib_id = match.group()
-                    self._library_id_cache[cache_key] = lib_id
-                    logger.info(f"Resolved library: {library_name} -> {lib_id}")
-                    return lib_id
-            except (KeyError, IndexError) as e:
-                logger.warning(f"Failed to parse library ID response: {e}")
+        # Handle API errors (network, timeout, etc.)
+        if data is None:
+            logger.warning(
+                f"API error resolving library: {library_name}",
+                extra={"library": library_name, "query": query}
+            )
+            return LibraryResolutionResult(
+                library_name=library_name,
+                status=LibraryResolutionStatus.API_ERROR,
+                query=query,
+                message="Failed to connect to Context7 API"
+            )
 
-        # Cache the failure too (to avoid repeated lookups)
-        self._library_id_cache[cache_key] = None
-        logger.warning(f"Library not found in Context7: {library_name}")
-        return None
+        # Check for result presence
+        if "result" not in data:
+            # Check if there's an error in the response
+            error_msg = data.get("error", {}).get("message", "Unknown error")
+            logger.warning(
+                f"Context7 API error for {library_name}: {error_msg}",
+                extra={"library": library_name, "query": query, "error": error_msg}
+            )
+            return LibraryResolutionResult(
+                library_name=library_name,
+                status=LibraryResolutionStatus.API_ERROR,
+                query=query,
+                message=f"API error: {error_msg}",
+                raw_response=str(data)
+            )
+
+        # Try to extract library ID from response
+        try:
+            content_list = data["result"].get("content", [])
+
+            # Handle empty content list - library not found
+            if not content_list:
+                self._library_id_cache[cache_key] = None
+                logger.warning(
+                    f"Library not found in Context7: {library_name} (empty results)",
+                    extra={"library": library_name, "query": query}
+                )
+                return LibraryResolutionResult(
+                    library_name=library_name,
+                    status=LibraryResolutionStatus.EMPTY_RESULTS,
+                    query=query,
+                    message="Context7 returned no results for this library"
+                )
+
+            text = content_list[0].get("text", "")
+
+            # Check for "no results" indicators in the response text
+            no_results_indicators = [
+                "no results found",
+                "no libraries found",
+                "not found",
+                "no matching",
+                "could not find",
+                "unable to find",
+            ]
+            text_lower = text.lower()
+            if any(indicator in text_lower for indicator in no_results_indicators):
+                self._library_id_cache[cache_key] = None
+                logger.warning(
+                    f"Library not found in Context7: {library_name}",
+                    extra={
+                        "library": library_name,
+                        "query": query,
+                        "response_snippet": text[:200]
+                    }
+                )
+                return LibraryResolutionResult(
+                    library_name=library_name,
+                    status=LibraryResolutionStatus.NOT_FOUND,
+                    query=query,
+                    message="Library not available in Context7",
+                    raw_response=text[:500] if text else None
+                )
+
+            # Extract library ID from response
+            match = re.search(r"/[\w-]+/[\w-]+", text)
+            if match:
+                lib_id = match.group()
+                self._library_id_cache[cache_key] = lib_id
+                logger.info(
+                    f"Resolved library: {library_name} -> {lib_id}",
+                    extra={"library": library_name, "library_id": lib_id}
+                )
+                return LibraryResolutionResult(
+                    library_name=library_name,
+                    status=LibraryResolutionStatus.RESOLVED,
+                    library_id=lib_id,
+                    query=query,
+                    message=f"Successfully resolved to {lib_id}"
+                )
+            else:
+                # No match found - response didn't contain a valid library ID
+                self._library_id_cache[cache_key] = None
+                logger.warning(
+                    f"No valid library ID found in response for: {library_name}",
+                    extra={
+                        "library": library_name,
+                        "query": query,
+                        "response_snippet": text[:200]
+                    }
+                )
+                return LibraryResolutionResult(
+                    library_name=library_name,
+                    status=LibraryResolutionStatus.NOT_FOUND,
+                    query=query,
+                    message="No valid library ID in Context7 response",
+                    raw_response=text[:500] if text else None
+                )
+
+        except (KeyError, IndexError, TypeError) as e:
+            logger.warning(
+                f"Failed to parse library ID response for {library_name}: {e}",
+                extra={"library": library_name, "error": str(e)}
+            )
+            return LibraryResolutionResult(
+                library_name=library_name,
+                status=LibraryResolutionStatus.INVALID_RESPONSE,
+                query=query,
+                message=f"Invalid response format: {e}",
+                raw_response=str(data.get("result", {}))[:500]
+            )
+
+    def resolve_library_id(
+        self,
+        library_name: str,
+        query: str = "documentation"
+    ) -> Optional[str]:
+        """Resolve a library name to a Context7 library ID.
+
+        This is a convenience wrapper around resolve_library_id_detailed()
+        that returns just the library ID or None.
+
+        Args:
+            library_name: Name of the library (e.g., "langgraph")
+            query: Query hint for resolution
+
+        Returns:
+            Library ID (e.g., "/langchain-ai/langgraph") or None if not found
+        """
+        result = self.resolve_library_id_detailed(library_name, query)
+        return result.library_id
 
     def get_library_docs(
         self,
@@ -328,10 +581,12 @@ class Context7Client:
     ) -> Optional[str]:
         """Get documentation for a specific library.
 
-        This calls get-library-docs after resolve-library-id per spec requirement.
+        NOTE: This method requires a pre-resolved library_id. For most use cases,
+        prefer `resolve_and_fetch_docs()` which chains resolve -> get_library_docs
+        automatically per spec requirement.
 
         Args:
-            library_id: Resolved library ID
+            library_id: Resolved library ID (from resolve_library_id)
             query: Documentation query
             max_tokens: Optional max tokens limit
 
@@ -366,16 +621,179 @@ class Context7Client:
         """Query documentation for a specific library.
 
         Alias for get_library_docs for backwards compatibility.
+
+        NOTE: For most use cases, prefer `resolve_and_fetch_docs()` which
+        chains resolve -> get_library_docs automatically per spec requirement.
         """
         return self.get_library_docs(library_id, query)
 
-    def fetch_and_cache(
+    def resolve_and_fetch_docs(
+        self,
+        library_name: str,
+        query: str = "documentation",
+        max_tokens: Optional[int] = None
+    ) -> tuple[LibraryResolutionResult, Optional[str]]:
+        """Resolve library and fetch docs in one call.
+
+        RECOMMENDED: This method implements the spec requirement to ALWAYS call
+        get-library-docs after a successful resolve-library-id. It chains the
+        two operations and handles caching of the resolved library ID.
+
+        Args:
+            library_name: Library name to resolve (e.g., "langgraph")
+            query: Documentation query (default: "documentation")
+            max_tokens: Optional max tokens limit for docs
+
+        Returns:
+            Tuple of (LibraryResolutionResult, documentation_content or None)
+
+        Example:
+            >>> client = Context7Client()
+            >>> resolution, docs = client.resolve_and_fetch_docs("langgraph", "getting started")
+            >>> if resolution.is_success and docs:
+            ...     print(f"Found docs for {resolution.library_id}")
+            >>> elif resolution.is_not_found:
+            ...     print(f"Library not found: {resolution.message}")
+        """
+        # Step 1: Resolve library ID (uses cache if available)
+        resolution = self.resolve_library_id_detailed(library_name, query)
+
+        # Step 2: If resolution failed, return early
+        if not resolution.is_success:
+            logger.warning(
+                f"Cannot fetch docs - library resolution failed: {library_name}",
+                extra={
+                    "library": library_name,
+                    "status": resolution.status.value,
+                    "message": resolution.message
+                }
+            )
+            return resolution, None
+
+        # Step 3: ALWAYS call get-library-docs after successful resolution (per spec)
+        docs = self.get_library_docs(resolution.library_id, query, max_tokens)
+
+        if docs:
+            logger.info(
+                f"Successfully fetched docs for {library_name}",
+                extra={
+                    "library": library_name,
+                    "library_id": resolution.library_id,
+                    "query": query[:50],
+                    "docs_length": len(docs)
+                }
+            )
+        else:
+            logger.warning(
+                f"Library resolved but docs fetch returned empty: {library_name}",
+                extra={
+                    "library": library_name,
+                    "library_id": resolution.library_id,
+                    "query": query
+                }
+            )
+
+        return resolution, docs
+
+    def resolve_and_fetch_docs_simple(
+        self,
+        library_name: str,
+        query: str = "documentation",
+        max_tokens: Optional[int] = None
+    ) -> Optional[str]:
+        """Simplified version that returns only the docs content.
+
+        Chains resolve-library-id -> get-library-docs automatically per spec.
+        Returns None if resolution fails OR if docs fetch fails.
+
+        Args:
+            library_name: Library name to resolve (e.g., "langgraph")
+            query: Documentation query (default: "documentation")
+            max_tokens: Optional max tokens limit
+
+        Returns:
+            Documentation content or None
+
+        Example:
+            >>> docs = client.resolve_and_fetch_docs_simple("langgraph", "StateGraph")
+            >>> if docs:
+            ...     print(docs)
+        """
+        _, docs = self.resolve_and_fetch_docs(library_name, query, max_tokens)
+        return docs
+
+    def get_docs_for_multiple_queries(
+        self,
+        library_name: str,
+        queries: list[str],
+        max_tokens: Optional[int] = None
+    ) -> dict[str, Optional[str]]:
+        """Fetch docs for multiple queries, resolving library ID once.
+
+        Efficiently chains resolve -> multiple get_library_docs calls.
+        The library ID is resolved once and cached, then get_library_docs
+        is called for each query (per spec requirement).
+
+        Args:
+            library_name: Library to fetch docs for
+            queries: List of documentation queries
+            max_tokens: Optional max tokens limit per query
+
+        Returns:
+            Dict mapping query -> documentation content (or None if failed)
+
+        Example:
+            >>> results = client.get_docs_for_multiple_queries(
+            ...     "langgraph",
+            ...     ["getting started", "StateGraph", "nodes and edges"]
+            ... )
+            >>> for query, docs in results.items():
+            ...     print(f"{query}: {'Found' if docs else 'Not found'}")
+        """
+        results: dict[str, Optional[str]] = {}
+
+        if not queries:
+            return results
+
+        # Resolve library ID once (uses cache if available)
+        resolution = self.resolve_library_id_detailed(library_name, queries[0])
+
+        if not resolution.is_success:
+            logger.warning(
+                f"Library resolution failed, returning empty results: {library_name}",
+                extra={"library": library_name, "status": resolution.status.value}
+            )
+            # Return all queries with None
+            return {q: None for q in queries}
+
+        library_id = resolution.library_id
+
+        # Fetch docs for each query using the resolved ID (per spec requirement)
+        for query in queries:
+            docs = self.get_library_docs(library_id, query, max_tokens)
+            results[query] = docs
+            if docs:
+                logger.debug(f"Fetched docs for {library_name}/{query}: {len(docs)} chars")
+            else:
+                logger.debug(f"No docs found for {library_name}/{query}")
+
+        logger.info(
+            f"Fetched docs for {library_name}: {sum(1 for d in results.values() if d)}/{len(queries)} succeeded",
+            extra={"library": library_name, "total_queries": len(queries)}
+        )
+
+        return results
+
+    def fetch_and_cache_detailed(
         self,
         library_name: str,
         query: str,
         force_refresh: bool = False
-    ) -> Optional[Path]:
-        """Fetch documentation and save to cache.
+    ) -> FetchResult:
+        """Fetch documentation and save to cache with detailed status.
+
+        This method provides detailed information about the fetch result,
+        enabling graceful handling of library-not-found scenarios.
 
         Args:
             library_name: Library to fetch docs for
@@ -383,7 +801,7 @@ class Context7Client:
             force_refresh: If True, bypass cache and re-fetch
 
         Returns:
-            Path to cached file or None on failure
+            FetchResult with status and detailed information
         """
         start_time = time.time()
 
@@ -395,19 +813,91 @@ class Context7Client:
         if cache_file.exists() and not force_refresh:
             self._stats["cache_hits"] += 1
             logger.debug(f"Cache hit: {cache_file.name}")
-            return cache_file
+            try:
+                with open(cache_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                doc = Context7Doc(
+                    title=f"{library_name}: {query}",
+                    content=data.get("response", ""),
+                    source_url=f"context7://{library_name}/{query}",
+                    code_blocks=data.get("code_blocks", 0),
+                    library_id=data.get("library_id"),
+                    query=query,
+                    fetched_at=data.get("fetched_at")
+                )
+                return FetchResult(
+                    library_name=library_name,
+                    query=query,
+                    status=FetchStatus.CACHED,
+                    doc=doc,
+                    cache_file=cache_file,
+                    duration_ms=(time.time() - start_time) * 1000
+                )
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Failed to load cached file {cache_file.name}: {e}")
+                # Continue to fetch fresh
 
-        # Resolve library ID
-        lib_id = self.resolve_library_id(library_name, query)
-        if not lib_id:
-            logger.warning(f"Could not resolve library ID for: {library_name}")
-            return None
+        # Resolve library ID with detailed status
+        resolution = self.resolve_library_id_detailed(library_name, query)
+
+        # Handle library not found gracefully
+        if not resolution.is_success:
+            duration_ms = (time.time() - start_time) * 1000
+
+            # Determine appropriate status
+            if resolution.is_not_found:
+                logger.warning(
+                    f"Library not found in Context7: {library_name}",
+                    extra={
+                        "library": library_name,
+                        "query": query,
+                        "resolution_status": resolution.status.value,
+                        "message": resolution.message
+                    }
+                )
+                return FetchResult(
+                    library_name=library_name,
+                    query=query,
+                    status=FetchStatus.LIBRARY_NOT_FOUND,
+                    error=resolution.message,
+                    duration_ms=duration_ms
+                )
+            else:
+                # API error or invalid response
+                logger.error(
+                    f"Failed to resolve library: {library_name}",
+                    extra={
+                        "library": library_name,
+                        "query": query,
+                        "resolution_status": resolution.status.value,
+                        "message": resolution.message
+                    }
+                )
+                return FetchResult(
+                    library_name=library_name,
+                    query=query,
+                    status=FetchStatus.FAILED,
+                    error=resolution.message,
+                    duration_ms=duration_ms
+                )
+
+        lib_id = resolution.library_id
 
         # Get docs using get-library-docs (per spec requirement)
         docs = self.get_library_docs(lib_id, query)
         if not docs or len(docs) < 100:
-            logger.warning(f"Insufficient documentation for: {library_name}/{query}")
-            return None
+            duration_ms = (time.time() - start_time) * 1000
+            logger.warning(
+                f"Insufficient documentation for: {library_name}/{query}",
+                extra={"library": library_name, "query": query, "library_id": lib_id}
+            )
+            return FetchResult(
+                library_name=library_name,
+                query=query,
+                status=FetchStatus.NOT_FOUND,
+                error="Insufficient documentation content",
+                duration_ms=duration_ms
+            )
 
         # Count code blocks
         code_blocks = docs.count("```") // 2
@@ -437,11 +927,58 @@ class Context7Client:
                     "duration_ms": duration_ms
                 }
             )
-            return cache_file
+
+            doc = Context7Doc(
+                title=f"{library_name}: {query}",
+                content=docs,
+                source_url=f"context7://{library_name}/{query}",
+                code_blocks=code_blocks,
+                library_id=lib_id,
+                query=query,
+                fetched_at=datetime.now().isoformat()
+            )
+
+            return FetchResult(
+                library_name=library_name,
+                query=query,
+                status=FetchStatus.SUCCESS,
+                doc=doc,
+                cache_file=cache_file,
+                duration_ms=duration_ms
+            )
 
         except IOError as e:
+            duration_ms = (time.time() - start_time) * 1000
             logger.error(f"Failed to write cache file: {e}")
-            return None
+            return FetchResult(
+                library_name=library_name,
+                query=query,
+                status=FetchStatus.FAILED,
+                error=f"Cache write failed: {e}",
+                duration_ms=duration_ms
+            )
+
+    def fetch_and_cache(
+        self,
+        library_name: str,
+        query: str,
+        force_refresh: bool = False
+    ) -> Optional[Path]:
+        """Fetch documentation and save to cache.
+
+        This is a convenience wrapper around fetch_and_cache_detailed()
+        that returns just the cache file path or None.
+
+        Args:
+            library_name: Library to fetch docs for
+            query: Query string
+            force_refresh: If True, bypass cache and re-fetch
+
+        Returns:
+            Path to cached file or None on failure
+        """
+        result = self.fetch_and_cache_detailed(library_name, query, force_refresh)
+        return result.cache_file if result.status in (FetchStatus.SUCCESS, FetchStatus.CACHED) else None
 
     def fetch_batch(
         self,
@@ -475,45 +1012,30 @@ class Context7Client:
         )
 
         def fetch_single(query: str) -> FetchResult:
-            start = time.time()
+            """Fetch a single query using detailed method for proper status tracking."""
             try:
-                cache_file = self.fetch_and_cache(library_name, query)
-                if cache_file:
-                    # Load the cached doc
-                    with open(cache_file, encoding="utf-8") as f:
-                        data = json.load(f)
-                    doc = Context7Doc(
-                        title=f"{library_name}: {query}",
-                        content=data.get("response", ""),
-                        source_url=f"context7://{library_name}/{query}",
-                        code_blocks=data.get("code_blocks", 0),
-                        library_id=data.get("library_id"),
-                        query=query,
-                        fetched_at=data.get("fetched_at")
-                    )
-                    return FetchResult(
-                        library_name=library_name,
-                        query=query,
-                        status=FetchStatus.SUCCESS,
-                        doc=doc,
-                        cache_file=cache_file,
-                        duration_ms=(time.time() - start) * 1000
-                    )
-                else:
-                    return FetchResult(
-                        library_name=library_name,
-                        query=query,
-                        status=FetchStatus.NOT_FOUND,
-                        duration_ms=(time.time() - start) * 1000
-                    )
+                # Use detailed method to get proper status (LIBRARY_NOT_FOUND, etc.)
+                return self.fetch_and_cache_detailed(library_name, query)
             except Exception as e:
                 return FetchResult(
                     library_name=library_name,
                     query=query,
                     status=FetchStatus.FAILED,
                     error=str(e),
-                    duration_ms=(time.time() - start) * 1000
+                    duration_ms=0.0
                 )
+
+        def update_progress(result: FetchResult) -> None:
+            """Update progress based on fetch result status."""
+            progress.completed += 1
+            if result.status == FetchStatus.SUCCESS:
+                progress.successful += 1
+            elif result.status == FetchStatus.CACHED:
+                progress.cached += 1
+            elif result.status == FetchStatus.LIBRARY_NOT_FOUND:
+                progress.library_not_found += 1
+            else:
+                progress.failed += 1
 
         if parallel and len(queries) > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -522,14 +1044,7 @@ class Context7Client:
                 for future in as_completed(futures):
                     result = future.result()
                     results.append(result)
-
-                    progress.completed += 1
-                    if result.status == FetchStatus.SUCCESS:
-                        progress.successful += 1
-                    elif result.status == FetchStatus.CACHED:
-                        progress.cached += 1
-                    else:
-                        progress.failed += 1
+                    update_progress(result)
 
                     if on_progress:
                         on_progress(progress)
@@ -537,27 +1052,32 @@ class Context7Client:
             for query in queries:
                 result = fetch_single(query)
                 results.append(result)
-
-                progress.completed += 1
-                if result.status == FetchStatus.SUCCESS:
-                    progress.successful += 1
-                elif result.status == FetchStatus.CACHED:
-                    progress.cached += 1
-                else:
-                    progress.failed += 1
+                update_progress(result)
 
                 if on_progress:
                     on_progress(progress)
 
-        logger.info(
-            f"Batch fetch complete for {library_name}",
-            extra={
-                "total": progress.total,
-                "successful": progress.successful,
-                "failed": progress.failed,
-                "cached": progress.cached
-            }
-        )
+        # Log with appropriate level based on results
+        if progress.library_not_found > 0 and progress.successful == 0:
+            # All queries failed due to library not found - graceful fallback
+            logger.warning(
+                f"Library '{library_name}' not found in Context7 (all {progress.total} queries returned no results)",
+                extra={
+                    "total": progress.total,
+                    "library_not_found": progress.library_not_found,
+                }
+            )
+        else:
+            logger.info(
+                f"Batch fetch complete for {library_name}",
+                extra={
+                    "total": progress.total,
+                    "successful": progress.successful,
+                    "failed": progress.failed,
+                    "cached": progress.cached,
+                    "library_not_found": progress.library_not_found
+                }
+            )
 
         return BatchFetchResult(results=results, progress=progress)
 

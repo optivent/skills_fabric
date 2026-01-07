@@ -45,6 +45,8 @@ from .context7 import (
     FetchProgress,
     FetchResult,
     BatchFetchResult,
+    LibraryResolutionStatus,
+    LibraryResolutionResult,
 )
 from .exa_search import ExaSearchClient
 from .fusion import MultiSourceFusion
@@ -68,6 +70,8 @@ __all__ = [
     "FetchProgress",
     "FetchResult",
     "BatchFetchResult",
+    "LibraryResolutionStatus",
+    "LibraryResolutionResult",
     # Exa Search
     "ExaSearchClient",
     # Fusion
