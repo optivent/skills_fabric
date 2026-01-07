@@ -38,7 +38,14 @@ from .codewiki import (
     crawl_and_store,
     crawl_local_and_store,
 )
-from .context7 import Context7Client
+from .context7 import (
+    Context7Client,
+    Context7Doc,
+    FetchStatus,
+    FetchProgress,
+    FetchResult,
+    BatchFetchResult,
+)
 from .exa_search import ExaSearchClient
 from .fusion import MultiSourceFusion
 
@@ -56,6 +63,11 @@ __all__ = [
     "crawl_local_and_store",
     # Context7
     "Context7Client",
+    "Context7Doc",
+    "FetchStatus",
+    "FetchProgress",
+    "FetchResult",
+    "BatchFetchResult",
     # Exa Search
     "ExaSearchClient",
     # Fusion
