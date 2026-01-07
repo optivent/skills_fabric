@@ -37,7 +37,17 @@ from .miner import MinerAgent, MiningTask, MiningResult
 from .linker import LinkerAgent, LinkingTask, LinkingResult
 from .verifier import VerifierAgent, VerificationTask, VerificationResult
 from .writer import WriterAgent, WritingTask, WritingResult
-from .auditor import AuditorAgent, AuditTask, AuditResult, Claim, ClaimVerification
+from .auditor import (
+    AuditorAgent,
+    AuditTask,
+    AuditResult,
+    Claim,
+    ClaimVerification,
+    ClaimType,
+    ClaimSeverity,
+    audit_content,
+    verify_claims_only,
+)
 from .supervisor import (
     SupervisorAgent,
     SupervisorResult,
@@ -75,6 +85,10 @@ __all__ = [
     "AuditResult",
     "Claim",
     "ClaimVerification",
+    "ClaimType",
+    "ClaimSeverity",
+    "audit_content",
+    "verify_claims_only",
     # Supervisor
     "SupervisorAgent",
     "SupervisorResult",
