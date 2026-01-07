@@ -2,7 +2,7 @@
 
 Provides research and search APIs for:
 - Perplexity AI (sonar model) - Research queries with citations
-- Brave Search - Web and news search (coming in 4.3-4.4)
+- Brave Search - Web and news search with freshness filters
 
 Features:
 - Citation extraction and validation
@@ -11,6 +11,9 @@ Features:
 - Multiple refinement strategies (RELATED, REFINE, VALIDATE, COMPREHENSIVE, CITATIONS)
 - Research depth and convergence tracking
 - Related questions for follow-up research
+- Web and news search (Brave)
+- Freshness filtering (pd, pw, pm, py)
+- Technical/academic source filtering
 """
 from .perplexity_client import (
     PerplexityClient,
@@ -31,18 +34,28 @@ from .perplexity_client import (
     RefinedQuery,
 )
 
+from .brave_search_client import (
+    BraveSearchClient,
+    BraveConfig,
+    BraveSearchResponse,
+    SearchResult,
+    Freshness,
+    SafeSearch,
+    ResultSource,
+)
+
 __all__ = [
-    # Client
+    # Perplexity Client
     "PerplexityClient",
     "PerplexityConfig",
     "PerplexityResponse",
-    # Models
+    # Perplexity Models
     "SonarModel",
     "SearchDomain",
     # Research strategies and tracking
     "RefinementStrategy",
     "ResearchStopReason",
-    # Data classes
+    # Perplexity Data classes
     "Citation",
     "CitationValidation",
     "RelatedQuestion",
@@ -51,4 +64,12 @@ __all__ = [
     "ResearchMetrics",
     "RefinedQuery",
     "TokenUsage",
+    # Brave Search Client
+    "BraveSearchClient",
+    "BraveConfig",
+    "BraveSearchResponse",
+    "SearchResult",
+    "Freshness",
+    "SafeSearch",
+    "ResultSource",
 ]
