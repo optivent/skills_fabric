@@ -1066,3 +1066,465 @@ class TestLSPClientRequestResponse:
         client = LSPClient()
         notifications = client.get_pending_notifications()
         assert notifications == []
+
+
+# =============================================================================
+# Thread Safety Tests
+# =============================================================================
+
+
+class TestLSPClientThreadSafety:
+    """Test thread-safe message handling."""
+
+    def test_pending_lock_exists(self):
+        """Test that pending responses lock is initialized."""
+        import threading
+        client = LSPClient()
+        assert hasattr(client, "_pending_lock")
+        assert isinstance(client._pending_lock, type(threading.Lock()))
+
+    def test_send_lock_exists(self):
+        """Test that send lock is initialized."""
+        import threading
+        client = LSPClient()
+        assert hasattr(client, "_send_lock")
+        assert isinstance(client._send_lock, type(threading.Lock()))
+
+    def test_message_queues_initialized(self):
+        """Test that message queues are properly initialized."""
+        import queue
+        client = LSPClient()
+        assert hasattr(client, "_response_queue")
+        assert hasattr(client, "_notification_queue")
+        assert isinstance(client._response_queue, queue.Queue)
+        assert isinstance(client._notification_queue, queue.Queue)
+
+    def test_pending_notifications_drains_queue(self):
+        """Test get_pending_notifications drains the notification queue."""
+        client = LSPClient()
+
+        # Add notifications to queue
+        for i in range(3):
+            msg = JsonRpcMessage(method=f"test/method{i}")
+            client._notification_queue.put(msg)
+
+        notifications = client.get_pending_notifications()
+
+        assert len(notifications) == 3
+        assert client._notification_queue.empty()
+
+    def test_pending_responses_dict_initialized(self):
+        """Test that pending responses dictionary is initialized."""
+        client = LSPClient()
+        assert hasattr(client, "_pending_responses")
+        assert isinstance(client._pending_responses, dict)
+        assert len(client._pending_responses) == 0
+
+
+# =============================================================================
+# Message Dispatch Tests
+# =============================================================================
+
+
+class TestMessageDispatch:
+    """Test message dispatch routing."""
+
+    def test_dispatch_response_to_pending_queue(self):
+        """Test that responses are dispatched to pending request queues."""
+        import queue
+        client = LSPClient()
+
+        # Create a pending request with its queue
+        response_queue = queue.Queue()
+        with client._pending_lock:
+            client._pending_responses[42] = response_queue
+
+        # Dispatch a response
+        response = JsonRpcMessage(id=42, result={"test": True})
+        client._dispatch_message(response)
+
+        # Response should be in the queue
+        assert not response_queue.empty()
+        received = response_queue.get_nowait()
+        assert received.id == 42
+        assert received.result == {"test": True}
+
+    def test_dispatch_notification_to_queue(self):
+        """Test that notifications are dispatched to notification queue."""
+        client = LSPClient()
+
+        notification = JsonRpcMessage(method="window/logMessage", params={"message": "test"})
+        client._dispatch_message(notification)
+
+        assert not client._notification_queue.empty()
+        received = client._notification_queue.get_nowait()
+        assert received.method == "window/logMessage"
+
+    def test_dispatch_unknown_response_id_handled(self):
+        """Test that responses with unknown IDs are handled gracefully."""
+        client = LSPClient()
+
+        # Response for request we never made
+        response = JsonRpcMessage(id=999, result={})
+        # Should not raise, just log warning
+        client._dispatch_message(response)
+
+
+# =============================================================================
+# Content-Length Edge Cases
+# =============================================================================
+
+
+class TestMessageBufferEdgeCases:
+    """Test edge cases for MessageBuffer Content-Length framing."""
+
+    def test_zero_content_length(self):
+        """Test handling zero Content-Length."""
+        buffer = MessageBuffer()
+        buffer.append(b"Content-Length: 0\r\n\r\n")
+        # Empty body should result in JSON parse error
+        result = buffer.try_parse_message()
+        assert result is None
+
+    def test_large_content_length_partial(self):
+        """Test handling large Content-Length with partial data."""
+        buffer = MessageBuffer()
+        # Claim 10000 bytes but only send a few
+        buffer.append(b"Content-Length: 10000\r\n\r\n{}")
+        result = buffer.try_parse_message()
+        # Should return None since body is incomplete
+        assert result is None
+
+    def test_negative_content_length(self):
+        """Test handling invalid negative Content-Length."""
+        buffer = MessageBuffer()
+        buffer.append(b"Content-Length: -1\r\n\r\n{}")
+        result = buffer.try_parse_message()
+        # Should handle gracefully (likely skip or error)
+        assert result is None
+
+    def test_non_numeric_content_length(self):
+        """Test handling non-numeric Content-Length."""
+        buffer = MessageBuffer()
+        buffer.append(b"Content-Length: abc\r\n\r\n{}")
+        result = buffer.try_parse_message()
+        assert result is None
+
+    def test_multiple_content_length_headers(self):
+        """Test handling multiple Content-Length headers."""
+        buffer = MessageBuffer()
+        # Only the last one should be used (or first, depending on impl)
+        content = b'{"jsonrpc": "2.0", "id": 1}'
+        buffer.append(f"Content-Length: 999\r\nContent-Length: {len(content)}\r\n\r\n".encode() + content)
+        result = buffer.try_parse_message()
+        # Should either parse correctly or handle gracefully
+        # The implementation should use the actual Content-Length
+
+    def test_carriage_return_in_header_value(self):
+        """Test proper handling of CRLF line endings."""
+        buffer = MessageBuffer()
+        content = b'{"jsonrpc": "2.0", "id": 1}'
+        # Proper CRLF format
+        message = f"Content-Length: {len(content)}\r\n\r\n".encode() + content
+        buffer.append(message)
+        result = buffer.try_parse_message()
+        assert result is not None
+        assert result.id == 1
+
+
+# =============================================================================
+# LSP Server Start/Stop Tests
+# =============================================================================
+
+
+class TestLSPClientServerLifecycle:
+    """Test LSP server start/stop behavior."""
+
+    def test_stop_server_when_not_started(self):
+        """Test stop_server is safe when server not started."""
+        client = LSPClient()
+        # Should not raise
+        client.stop_server()
+        assert client._process is None
+        assert client._running is False
+
+    @patch("subprocess.Popen")
+    def test_start_server_file_not_found(self, mock_popen):
+        """Test handling when LSP server binary not found."""
+        mock_popen.side_effect = FileNotFoundError("pylsp not found")
+
+        client = LSPClient()
+        result = client.start_server(Path("/tmp/project"), "python")
+
+        assert result is False
+        assert client._initialization_failed is True
+        assert client.is_available is False
+
+    @patch("subprocess.Popen")
+    def test_start_server_unsupported_language(self, mock_popen):
+        """Test starting server for unsupported language."""
+        client = LSPClient()
+        result = client.start_server(Path("/tmp/project"), "unsupported_lang")
+
+        assert result is False
+        # Popen should not be called
+        mock_popen.assert_not_called()
+
+    def test_stop_server_handles_shutdown_exception(self):
+        """Test stop_server handles exceptions during shutdown request."""
+        client = LSPClient()
+        client._running = True
+
+        # Mock process with normal terminate/wait behavior
+        mock_process = MagicMock()
+        mock_process.poll.return_value = None  # Process running
+        mock_process.stdin = MagicMock()
+        mock_process.stdout = MagicMock()
+        mock_process.stdout.read1.return_value = b""  # Empty read
+        mock_process.wait.return_value = 0
+        client._process = mock_process
+
+        # Mock _send_request to raise an exception during shutdown
+        with patch.object(client, "_send_request", side_effect=Exception("shutdown failed")):
+            # Should not raise - shutdown errors are caught
+            client.stop_server()
+
+        # Should still clean up
+        assert client._process is None
+        assert client._running is False
+        # Terminate should have been called
+        mock_process.terminate.assert_called_once()
+
+
+# =============================================================================
+# Location Parsing Edge Cases
+# =============================================================================
+
+
+class TestLocationEdgeCases:
+    """Test edge cases for Location parsing."""
+
+    def test_parse_location_with_missing_range(self):
+        """Test parsing location with missing range field."""
+        lsp_loc = {"uri": "file:///path/to/file.py"}
+        loc = Location.from_lsp_location(lsp_loc)
+        assert loc is not None
+        assert loc.file == "/path/to/file.py"
+        assert loc.line == 0
+        assert loc.column == 0
+
+    def test_parse_location_link_with_missing_uri(self):
+        """Test parsing location link with missing targetUri."""
+        lsp_link = {
+            "targetRange": {"start": {"line": 10, "character": 0}}
+        }
+        loc = Location.from_lsp_location_link(lsp_link)
+        assert loc is not None
+        assert loc.file == ""
+
+    def test_location_with_windows_path(self):
+        """Test Location handles Windows-style file URIs."""
+        lsp_loc = {
+            "uri": "file:///C:/Users/test/file.py",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        }
+        loc = Location.from_lsp_location(lsp_loc)
+        assert loc is not None
+        assert "C:" in loc.file or "Users" in loc.file
+
+
+# =============================================================================
+# Convenience Method Edge Cases
+# =============================================================================
+
+
+class TestConvenienceMethodEdgeCases:
+    """Test edge cases for convenience methods."""
+
+    def test_find_definition_no_auto_open(self):
+        """Test find_definition with auto_open=False."""
+        client = LSPClient()
+        client._process = MagicMock()
+
+        with patch.object(client, "_send_request") as mock_request:
+            mock_request.return_value = {
+                "uri": "file:///path/to/def.py",
+                "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}}
+            }
+
+            with patch.object(client, "open_document") as mock_open:
+                with patch.object(client, "close_document") as mock_close:
+                    client.find_definition(Path("/test/file.py"), 0, 0, auto_open=False)
+
+                    mock_open.assert_not_called()
+                    mock_close.assert_not_called()
+
+    def test_find_references_no_auto_open(self):
+        """Test find_references with auto_open=False."""
+        client = LSPClient()
+        client._process = MagicMock()
+
+        with patch.object(client, "get_references") as mock_refs:
+            mock_refs.return_value = [Location(file="/test/file.py", line=5, column=0)]
+
+            with patch.object(client, "open_document") as mock_open:
+                with patch.object(client, "close_document") as mock_close:
+                    client.find_references(Path("/test/file.py"), 0, 0, auto_open=False)
+
+                    mock_open.assert_not_called()
+                    mock_close.assert_not_called()
+
+    def test_find_definition_returns_none_when_not_found(self):
+        """Test find_definition returns None when definition not found."""
+        client = LSPClient()
+        client._process = MagicMock()
+
+        with patch.object(client, "_send_request", return_value=None):
+            with patch.object(client, "open_document", return_value=True):
+                with patch.object(client, "close_document", return_value=True):
+                    result = client.find_definition(Path("/test/file.py"), 0, 0)
+                    assert result is None
+
+    def test_find_all_definitions_returns_multiple_citations(self):
+        """Test find_all_definitions returns list of citations."""
+        client = LSPClient()
+        client._process = MagicMock()
+
+        with patch.object(client, "_send_request") as mock_request:
+            mock_request.return_value = [
+                {"uri": "file:///path/def1.py", "range": {"start": {"line": 9, "character": 0}, "end": {"line": 9, "character": 10}}},
+                {"uri": "file:///path/def2.py", "range": {"start": {"line": 19, "character": 0}, "end": {"line": 19, "character": 10}}},
+            ]
+
+            with patch.object(client, "open_document", return_value=True):
+                with patch.object(client, "close_document", return_value=True):
+                    results = client.find_all_definitions(Path("/test/file.py"), 0, 0)
+
+                    assert len(results) == 2
+                    # 1-indexed citations
+                    assert results[0] == "/path/def1.py:10"
+                    assert results[1] == "/path/def2.py:20"
+
+
+# =============================================================================
+# Language ID Detection Tests
+# =============================================================================
+
+
+class TestLanguageIdDetection:
+    """Test language ID detection for document open."""
+
+    def test_python_language_id(self, tmp_path: Path):
+        """Test Python files get correct language ID."""
+        client = LSPClient()
+        py_file = tmp_path / "test.py"
+        py_file.write_text("# test")
+
+        with patch.object(client, "_send_notification") as mock_notify:
+            client.open_document(py_file)
+
+            call_args = mock_notify.call_args[0]
+            assert call_args[1]["textDocument"]["languageId"] == "python"
+
+    def test_typescript_language_id(self, tmp_path: Path):
+        """Test TypeScript files get correct language ID."""
+        client = LSPClient()
+        ts_file = tmp_path / "test.ts"
+        ts_file.write_text("// test")
+
+        with patch.object(client, "_send_notification") as mock_notify:
+            client.open_document(ts_file)
+
+            call_args = mock_notify.call_args[0]
+            assert call_args[1]["textDocument"]["languageId"] == "typescript"
+
+    def test_tsx_language_id(self, tmp_path: Path):
+        """Test TSX files get correct language ID."""
+        client = LSPClient()
+        tsx_file = tmp_path / "test.tsx"
+        tsx_file.write_text("// test")
+
+        with patch.object(client, "_send_notification") as mock_notify:
+            client.open_document(tsx_file)
+
+            call_args = mock_notify.call_args[0]
+            assert call_args[1]["textDocument"]["languageId"] == "typescriptreact"
+
+    def test_javascript_language_id(self, tmp_path: Path):
+        """Test JavaScript files get correct language ID."""
+        client = LSPClient()
+        js_file = tmp_path / "test.js"
+        js_file.write_text("// test")
+
+        with patch.object(client, "_send_notification") as mock_notify:
+            client.open_document(js_file)
+
+            call_args = mock_notify.call_args[0]
+            assert call_args[1]["textDocument"]["languageId"] == "javascript"
+
+    def test_jsx_language_id(self, tmp_path: Path):
+        """Test JSX files get correct language ID."""
+        client = LSPClient()
+        jsx_file = tmp_path / "test.jsx"
+        jsx_file.write_text("// test")
+
+        with patch.object(client, "_send_notification") as mock_notify:
+            client.open_document(jsx_file)
+
+            call_args = mock_notify.call_args[0]
+            assert call_args[1]["textDocument"]["languageId"] == "javascriptreact"
+
+    def test_unknown_extension_gets_plaintext(self, tmp_path: Path):
+        """Test unknown extensions get 'plaintext' language ID."""
+        client = LSPClient()
+        txt_file = tmp_path / "test.xyz"
+        txt_file.write_text("test")
+
+        with patch.object(client, "_send_notification") as mock_notify:
+            client.open_document(txt_file)
+
+            call_args = mock_notify.call_args[0]
+            assert call_args[1]["textDocument"]["languageId"] == "plaintext"
+
+
+# =============================================================================
+# Include Declaration Parameter Tests
+# =============================================================================
+
+
+class TestIncludeDeclarationParameter:
+    """Test include_declaration parameter in references."""
+
+    def test_references_include_declaration_true(self):
+        """Test get_references passes includeDeclaration=true."""
+        client = LSPClient()
+        client._process = MagicMock()
+
+        captured_params = []
+
+        def capture_request(method, params, **kwargs):
+            captured_params.append(params)
+            return []
+
+        with patch.object(client, "_send_request", side_effect=capture_request):
+            client.get_references(Path("/test/file.py"), 0, 0, include_declaration=True)
+
+            assert len(captured_params) == 1
+            assert captured_params[0]["context"]["includeDeclaration"] is True
+
+    def test_references_include_declaration_false(self):
+        """Test get_references passes includeDeclaration=false."""
+        client = LSPClient()
+        client._process = MagicMock()
+
+        captured_params = []
+
+        def capture_request(method, params, **kwargs):
+            captured_params.append(params)
+            return []
+
+        with patch.object(client, "_send_request", side_effect=capture_request):
+            client.get_references(Path("/test/file.py"), 0, 0, include_declaration=False)
+
+            assert len(captured_params) == 1
+            assert captured_params[0]["context"]["includeDeclaration"] is False
