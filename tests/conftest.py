@@ -773,3 +773,164 @@ slow = pytest.mark.slow
 
 # Marker for integration tests
 integration = pytest.mark.integration
+
+
+# =============================================================================
+# Helper Functions for Tests
+# =============================================================================
+
+def assert_symbol_found(
+    symbols: list,
+    name: str,
+    kind: str | None = None,
+) -> Any:
+    """Assert that a symbol with the given name exists.
+
+    Args:
+        symbols: List of symbols to search.
+        name: Name of the symbol to find.
+        kind: Optional kind to match (class, function, method).
+
+    Returns:
+        The found symbol.
+
+    Raises:
+        AssertionError: If symbol not found or kind doesn't match.
+    """
+    for symbol in symbols:
+        symbol_name = getattr(symbol, "name", str(symbol))
+        if symbol_name == name:
+            if kind is not None:
+                symbol_kind = getattr(symbol, "kind", None)
+                assert symbol_kind == kind, (
+                    f"Expected {name} to be {kind}, got {symbol_kind}"
+                )
+            return symbol
+
+    symbol_names = [getattr(s, "name", str(s)) for s in symbols]
+    raise AssertionError(f"Symbol '{name}' not found in: {symbol_names}")
+
+
+def assert_hall_m_below_threshold(
+    result: Any,
+    threshold: float = 0.02,
+) -> None:
+    """Assert that hallucination rate is below threshold.
+
+    Args:
+        result: Result object with hallucination_rate attribute.
+        threshold: Maximum allowed hallucination rate (default 0.02).
+
+    Raises:
+        AssertionError: If Hall_m exceeds threshold.
+    """
+    hall_m = getattr(result, "hallucination_rate", None)
+    if hall_m is None:
+        validated = getattr(result, "validated_count", 0)
+        rejected = getattr(result, "rejected_count", 0)
+        total = validated + rejected
+        hall_m = rejected / max(total, 1)
+
+    assert hall_m < threshold, (
+        f"Hall_m {hall_m:.4f} exceeds threshold {threshold}"
+    )
+
+
+def assert_citation_format(citation: str) -> None:
+    """Assert that a citation follows the file:line format.
+
+    Args:
+        citation: Citation string to check.
+
+    Raises:
+        AssertionError: If citation format is invalid.
+    """
+    assert ":" in citation, f"Citation must contain ':' separator: {citation}"
+    parts = citation.split(":")
+    assert len(parts) >= 2, f"Citation must have file:line format: {citation}"
+    # Line number should be numeric
+    try:
+        int(parts[1])
+    except ValueError:
+        raise AssertionError(f"Line number must be numeric: {citation}")
+
+
+# =============================================================================
+# Auditor Agent Fixtures
+# =============================================================================
+
+@pytest.fixture
+def mock_auditor():
+    """Create a mock AuditorAgent for testing."""
+    from skills_fabric.agents import ClaimType, ClaimSeverity
+
+    auditor = MagicMock()
+
+    # Mock audit result
+    mock_claim = MagicMock()
+    mock_claim.text = "The function returns a string"
+    mock_claim.claim_type = ClaimType.BEHAVIOR
+    mock_claim.severity = ClaimSeverity.MEDIUM
+    mock_claim.is_verified = True
+
+    mock_result = MagicMock()
+    mock_result.claims = [mock_claim]
+    mock_result.verified_count = 1
+    mock_result.unverified_count = 0
+    mock_result.hall_m = 0.0
+    mock_result.is_acceptable = True
+
+    auditor.audit.return_value = mock_result
+    auditor.audit_with_strict_mode.return_value = mock_result
+
+    return auditor
+
+
+# =============================================================================
+# Context7 Fixtures
+# =============================================================================
+
+@pytest.fixture
+def mock_context7_client():
+    """Create a mock Context7 client for testing."""
+    client = MagicMock()
+
+    # Mock library resolution
+    client.resolve_library_id.return_value = "test-library-123"
+
+    # Mock document fetching
+    mock_doc = MagicMock()
+    mock_doc.content = "Sample documentation content"
+    mock_doc.title = "API Guide"
+    mock_doc.source = "https://docs.example.com/guide"
+
+    client.fetch_docs.return_value = [mock_doc]
+    client.resolve_and_fetch_docs.return_value = [mock_doc]
+
+    return client
+
+
+# =============================================================================
+# Export all fixtures and helpers
+# =============================================================================
+
+__all__ = [
+    # Configuration hooks
+    "pytest_configure",
+    "pytest_collection_modifyitems",
+    # Skip markers
+    "requires_api_keys",
+    "requires_perplexity",
+    "requires_brave",
+    "slow",
+    "integration",
+    # Sample code constants
+    "SAMPLE_PYTHON_CODE",
+    "SAMPLE_TYPESCRIPT_CODE",
+    "SAMPLE_JAVASCRIPT_CODE",
+    "SAMPLE_MALFORMED_CODE",
+    # Helper functions
+    "assert_symbol_found",
+    "assert_hall_m_below_threshold",
+    "assert_citation_format",
+]
