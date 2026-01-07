@@ -27,11 +27,43 @@ __all__ = ["TSSymbol", "TreeSitterParser"]
 
 @dataclass
 class TSSymbol:
-    """A symbol extracted via Tree-sitter."""
+    """A symbol extracted via Tree-sitter.
+
+    This is a lightweight symbol representation for multi-language parsing.
+    For rich metadata (parameters, return types, docstrings, etc.), use
+    to_enhanced() to convert to EnhancedSymbol after Python AST analysis.
+
+    Attributes:
+        name: Symbol name (e.g., 'MyClass', 'myFunction')
+        kind: Symbol type ('class', 'function')
+        file_path: Path to the source file
+        line: Line number where the symbol is defined (1-indexed)
+        end_line: Line number where the symbol ends (optional)
+    """
     name: str
     kind: str
     file_path: str
     line: int
+    end_line: Optional[int] = None
+
+    def to_enhanced(self) -> "EnhancedSymbol":
+        """Convert to EnhancedSymbol for unified processing.
+
+        Returns:
+            EnhancedSymbol with basic fields populated. Rich metadata
+            fields (params, docstring, etc.) will be None/empty.
+
+        Note:
+            Import is done lazily to avoid circular imports.
+        """
+        from skills_fabric.analyze.ast_parser import EnhancedSymbol
+        return EnhancedSymbol(
+            name=self.name,
+            kind=self.kind,
+            file_path=self.file_path,
+            line=self.line,
+            end_line=self.end_line,
+        )
 
 
 class TreeSitterParser:
@@ -215,7 +247,8 @@ class TreeSitterParser:
                         name=name,
                         kind="class",
                         file_path=rel_path,
-                        line=node.start_point[0] + 1
+                        line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1
                     ))
 
             elif node.type in (
@@ -230,7 +263,8 @@ class TreeSitterParser:
                         name=name,
                         kind="function",
                         file_path=rel_path,
-                        line=node.start_point[0] + 1
+                        line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1
                     ))
 
             # Handle arrow functions assigned to variables (common in JS/JSX)
@@ -249,7 +283,8 @@ class TreeSitterParser:
                                 name=name_node.text.decode(),
                                 kind="function",
                                 file_path=rel_path,
-                                line=child.start_point[0] + 1
+                                line=child.start_point[0] + 1,
+                                end_line=child.end_point[0] + 1
                             ))
 
             # Recurse into children
