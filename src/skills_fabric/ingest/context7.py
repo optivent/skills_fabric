@@ -594,12 +594,14 @@ class Context7Client:
                 seen.add(q.lower())
                 unique_queries.append(q)
 
-        # Respect configurable limit (but default is 50, not 3!)
-        if len(unique_queries) > self.max_files:
+        # Respect configurable limit (0 means no limit - use ALL files!)
+        if self.max_files > 0 and len(unique_queries) > self.max_files:
             logger.warning(
                 f"Query count ({len(unique_queries)}) exceeds max_files ({self.max_files}), truncating"
             )
             unique_queries = unique_queries[:self.max_files]
+        else:
+            logger.info(f"Fetching ALL {len(unique_queries)} queries (no limit applied)")
 
         return self.fetch_batch(library_name, unique_queries, on_progress)
 
