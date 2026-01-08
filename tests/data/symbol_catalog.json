@@ -1,0 +1,143 @@
+{
+  "version": "1.0.0",
+  "generated_at": "2026-01-07T00:00:00Z",
+  "source_files": [
+    "tests/data/sample.py",
+    "tests/data/sample.ts",
+    "tests/data/sample.js"
+  ],
+  "symbols": {
+    "Person": {
+      "kind": "class",
+      "file": "tests/data/sample.py",
+      "line": 12,
+      "end_line": 57,
+      "docstring": "A person with name, age, and optional email.",
+      "members": ["greet", "greet_person", "is_adult", "from_dict"]
+    },
+    "Person.greet": {
+      "kind": "method",
+      "file": "tests/data/sample.py",
+      "line": 24,
+      "end_line": 30,
+      "parameters": ["self"],
+      "return_type": "str"
+    },
+    "Person.is_adult": {
+      "kind": "property",
+      "file": "tests/data/sample.py",
+      "line": 44,
+      "end_line": 46,
+      "return_type": "bool"
+    },
+    "Calculator": {
+      "kind": "class",
+      "file": "tests/data/sample.py",
+      "line": 60,
+      "end_line": 104,
+      "docstring": "A simple calculator with basic operations.",
+      "members": ["add", "subtract", "multiply", "from_precision", "history"]
+    },
+    "Calculator.add": {
+      "kind": "method",
+      "file": "tests/data/sample.py",
+      "line": 77,
+      "end_line": 89,
+      "parameters": ["self", "a", "b"],
+      "return_type": "float"
+    },
+    "Calculator.multiply": {
+      "kind": "staticmethod",
+      "file": "tests/data/sample.py",
+      "line": 96,
+      "end_line": 98,
+      "parameters": ["a", "b"],
+      "return_type": "float"
+    },
+    "fetch_data": {
+      "kind": "async_function",
+      "file": "tests/data/sample.py",
+      "line": 107,
+      "end_line": 121,
+      "parameters": ["url", "timeout"],
+      "return_type": "Dict[str, Any]"
+    },
+    "process_items": {
+      "kind": "function",
+      "file": "tests/data/sample.py",
+      "line": 124,
+      "end_line": 144,
+      "parameters": ["items", "transform", "strip"],
+      "return_type": "List[str]"
+    },
+    "User": {
+      "kind": "interface",
+      "file": "tests/data/sample.ts",
+      "line": 8,
+      "end_line": 14,
+      "language": "typescript"
+    },
+    "UserService": {
+      "kind": "class",
+      "file": "tests/data/sample.ts",
+      "line": 31,
+      "end_line": 121,
+      "language": "typescript",
+      "members": ["getUser", "createUser", "updateUser", "deleteUser", "getUsersByRole", "validateEmail"]
+    },
+    "formatUser": {
+      "kind": "function",
+      "file": "tests/data/sample.ts",
+      "line": 131,
+      "end_line": 135,
+      "language": "typescript"
+    },
+    "EventEmitter": {
+      "kind": "class",
+      "file": "tests/data/sample.js",
+      "line": 8,
+      "end_line": 95,
+      "language": "javascript",
+      "members": ["on", "once", "emit", "off", "removeAllListeners", "listenerCount"]
+    },
+    "DataProcessor": {
+      "kind": "class",
+      "file": "tests/data/sample.js",
+      "line": 100,
+      "end_line": 155,
+      "language": "javascript"
+    },
+    "debounce": {
+      "kind": "arrow_function",
+      "file": "tests/data/sample.js",
+      "line": 158,
+      "end_line": 163,
+      "language": "javascript"
+    },
+    "fetchWithRetry": {
+      "kind": "async_function",
+      "file": "tests/data/sample.js",
+      "line": 184,
+      "end_line": 202,
+      "language": "javascript"
+    }
+  },
+  "statistics": {
+    "total_symbols": 18,
+    "by_kind": {
+      "class": 5,
+      "function": 3,
+      "async_function": 2,
+      "method": 3,
+      "staticmethod": 1,
+      "property": 1,
+      "interface": 1,
+      "arrow_function": 2
+    },
+    "by_language": {
+      "python": 8,
+      "typescript": 5,
+      "javascript": 5
+    }
+  }
+}

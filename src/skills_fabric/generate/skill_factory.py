@@ -148,41 +148,55 @@ class SkillFactory:
     def _node_link(self, state: FactoryState) -> dict:
         """Create PROVEN links between concepts and symbols."""
         from ..link.proven_linker import ProvenLinker
-        
+
         print('[Link] Creating PROVEN links...')
-        
-        # First, store symbols in database (using parameterized queries)
-        for symbol in state['symbols'][:100]:  # Limit for speed
-            try:
-                self.db.execute(
-                    """
-                    CREATE (s:Symbol {
-                        name: $name,
-                        file_path: $file_path,
-                        line: $line
-                    })
-                    """,
-                    {
-                        "name": symbol["name"],
-                        "file_path": symbol["file_path"],
-                        "line": symbol["line"]
-                    }
-                )
-            except Exception:
-                pass  # Already exists
-        
+
+        # Store ALL symbols in database - NO LIMIT
+        # Process in batches to avoid memory issues
+        symbols = state['symbols']
+        batch_size = 100
+        total_stored = 0
+
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            for symbol in batch:
+                try:
+                    self.db.execute(
+                        """
+                        CREATE (s:Symbol {
+                            name: $name,
+                            file_path: $file_path,
+                            line: $line
+                        })
+                        """,
+                        {
+                            "name": symbol["name"],
+                            "file_path": symbol["file_path"],
+                            "line": symbol["line"]
+                        }
+                    )
+                    total_stored += 1
+                except Exception:
+                    pass  # Already exists
+
+            # Progress update for large batches
+            if len(symbols) > batch_size:
+                print(f'  [Link] Stored {min(i + batch_size, len(symbols))}/{len(symbols)} symbols...')
+
+        print(f'[Link] Stored {total_stored} symbols in database')
+
         linker = ProvenLinker()
         links_created = linker.link_all()
-        
-        # Get proven links for skill generation
-        res = self.db.execute('MATCH (c:Concept)-[:PROVEN]->(s:Symbol) RETURN c.name, s.name, s.file_path LIMIT 50')
+
+        # Get ALL proven links - NO LIMIT constraint!
+        res = self.db.execute('MATCH (c:Concept)-[:PROVEN]->(s:Symbol) RETURN c.name, s.name, s.file_path')
         proven = []
         while res.has_next():
             row = res.get_next()
             proven.append({'concept': row[0], 'symbol': row[1], 'file_path': row[2]})
-        
-        print(f'[Link] Created {links_created} links, using {len(proven)} for skills')
-        
+
+        print(f'[Link] Created {links_created} links, processing ALL {len(proven)} for skills')
+
         return {
             'proven_links': proven,
             'current_step': 'link_complete'
@@ -192,49 +206,61 @@ class SkillFactory:
         """Enrich with Context7 documentation."""
         from ..ingest.context7 import Context7Client
         from pathlib import Path
-        
+
         print('[Enrich] Fetching Context7 documentation...')
-        
+
         c7 = Context7Client()
-        
+
         # Fetch docs for the library
         cache_file = c7.fetch_and_cache(
             state['library_name'],
             'getting started tutorial examples'
         )
-        
+
         if cache_file:
             print(f'[Enrich] Cached to {cache_file}')
-        
-        # Load cached docs
+
+        # Load ALL cached docs - no [:5] limit
         cached_docs = c7.load_all_cached()
-        context7_text = '\n'.join([d.get('response', '')[:500] for d in cached_docs[:5]])
-        
-        # Create candidates from proven links
+        context7_text = '\n'.join([d.get('response', '')[:500] for d in cached_docs])
+        print(f'[Enrich] Loaded {len(cached_docs)} Context7 documents')
+
+        # Create candidates from ALL proven links - NO [:20] LIMIT!
         candidates = []
         repo_path = Path(state['repo_path'])
-        
-        for link in state['proven_links'][:20]:  # Limit for speed
-            try:
-                source_file = repo_path / link['file_path']
-                if source_file.exists():
-                    with open(source_file, 'r', errors='ignore') as f:
-                        source_code = f.read()[:2000]
-                else:
-                    source_code = ''
-                
-                candidates.append(SkillCandidate(
-                    concept_name=link['concept'],
-                    symbol_name=link['symbol'],
-                    file_path=link['file_path'],
-                    source_code=source_code,
-                    context7_docs=context7_text[:500]
-                ))
-            except Exception as e:
-                pass
-        
-        print(f'[Enrich] Created {len(candidates)} skill candidates')
-        
+        proven_links = state['proven_links']
+
+        print(f'[Enrich] Processing ALL {len(proven_links)} proven links...')
+
+        # Process in batches with progress tracking
+        batch_size = 50
+        for i in range(0, len(proven_links), batch_size):
+            batch = proven_links[i:i + batch_size]
+            for link in batch:
+                try:
+                    source_file = repo_path / link['file_path']
+                    if source_file.exists():
+                        with open(source_file, 'r', errors='ignore') as f:
+                            source_code = f.read()[:2000]
+                    else:
+                        source_code = ''
+
+                    candidates.append(SkillCandidate(
+                        concept_name=link['concept'],
+                        symbol_name=link['symbol'],
+                        file_path=link['file_path'],
+                        source_code=source_code,
+                        context7_docs=context7_text[:500]
+                    ))
+                except Exception:
+                    pass  # Skip problematic files
+
+            # Progress update for large batches
+            if len(proven_links) > batch_size:
+                print(f'  [Enrich] Processed {min(i + batch_size, len(proven_links))}/{len(proven_links)} links...')
+
+        print(f'[Enrich] Created {len(candidates)} skill candidates from ALL proven links')
+
         return {
             'candidates': candidates,
             'current_step': 'enrich_complete'

@@ -12,7 +12,12 @@ This client defaults to the CODING endpoint for use with coding tools.
 Features:
 - OpenAI-compatible API
 - Preserved thinking mode (reasoning persists across turns)
-- Streaming support
+- thinking_budget parameter for controlling reasoning token limits
+- Thinking metrics tracking and logging
+- Reasoning fallback: automatic retry without thinking when reasoning fails
+- Async streaming support for long-running code analysis
+- Proper token counting during streams
+- Graceful stream interruption handling
 - Cost tracking (Coding Plan: reduced rates)
 
 Usage:
@@ -23,13 +28,78 @@ Usage:
 
     # Or explicitly use general API
     client = GLMClient(api_key="your-key", use_coding_endpoint=False)
+
+    # With custom thinking budget for reasoning tasks
+    response = client.generate(
+        messages=[{"role": "user", "content": "Explain this code"}],
+        thinking=True,
+        thinking_budget=32000  # Up to 32K reasoning tokens
+    )
+
+    # Code explanation with thinking
+    response = client.explain_code(
+        code="def foo(): pass",
+        language="python"
+    )
+    print(f"Thinking tokens used: {response.usage.thinking_tokens}")
+    print(f"Budget used: {response.usage.thinking_budget_used_pct:.1f}%")
+
+    # With automatic fallback when reasoning fails
+    response = client.generate_with_fallback(
+        messages=[{"role": "user", "content": "Explain this code"}],
+        thinking_budget=16000
+    )
+    if response.used_fallback:
+        print("Reasoning failed, used non-thinking fallback")
+
+    # Multi-turn agent with preserved thinking
+    agent = GLMCodingAgent(thinking_budget=24000)
+    response = agent.send("Explain this function")
+    print(agent.get_thinking_usage())
+
+    # Async streaming for long-running code analysis
+    import asyncio
+
+    async def stream_analysis():
+        async for chunk in client.generate_stream_async(messages):
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
+            if chunk.is_final:
+                print(f"\\n\\nTokens: {chunk.completion_tokens}")
+                if chunk.interrupted:
+                    print(f"Stream interrupted: {chunk.interruption_type.value}")
+
+    asyncio.run(stream_analysis())
+
+    # Convenience method for streaming code analysis
+    async def analyze_code():
+        def on_chunk(chunk):
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
+
+        response, stats = await client.stream_code_analysis(
+            code=source_code,
+            language="python",
+            analysis_type="comprehensive",  # or "security", "performance"
+            on_chunk=on_chunk
+        )
+        print(f"\\n\\nAnalysis completed in {stats.total_duration_ms:.0f}ms")
+        print(f"Time to first token: {stats.time_to_first_token_ms:.0f}ms")
+        print(f"Tokens/sec: {stats.tokens_per_second:.1f}")
+
+    asyncio.run(analyze_code())
 """
 from dataclasses import dataclass, field
-from typing import Optional, Iterator, Any
+from typing import Optional, Iterator, Any, AsyncIterator, Union
 from enum import Enum
 import os
 import json
 import time
+import logging
+import asyncio
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 # Try to import httpx for async support, fall back to requests
 try:
@@ -40,11 +110,175 @@ except ImportError:
     import requests
 
 
+class StreamInterruptionType(Enum):
+    """Types of stream interruptions."""
+    NONE = "none"  # No interruption
+    TIMEOUT = "timeout"  # Stream timed out
+    CONNECTION_ERROR = "connection_error"  # Connection was lost
+    SERVER_ERROR = "server_error"  # Server sent an error
+    CLIENT_CANCELLED = "client_cancelled"  # Client cancelled the stream
+    MALFORMED_DATA = "malformed_data"  # Received invalid SSE data
+
+
+@dataclass
+class StreamChunk:
+    """A single chunk from a streaming response.
+
+    Represents one SSE event from the GLM API stream.
+    """
+    content: str = ""
+    thinking: str = ""
+    finish_reason: Optional[str] = None
+    is_final: bool = False
+    chunk_index: int = 0
+    # Token counts (may be partial during stream)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    thinking_tokens: int = 0
+    # Timing
+    latency_ms: float = 0.0
+    # Interruption handling
+    interrupted: bool = False
+    interruption_type: StreamInterruptionType = StreamInterruptionType.NONE
+    error_message: Optional[str] = None
+
+
+@dataclass
+class StreamingStats:
+    """Statistics collected during streaming.
+
+    Tracks tokens, timing, and interruptions during a streaming response.
+    """
+    total_chunks: int = 0
+    content_length: int = 0
+    thinking_length: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    thinking_tokens: int = 0
+    start_time: float = 0.0
+    first_chunk_time: float = 0.0
+    end_time: float = 0.0
+    interrupted: bool = False
+    interruption_type: StreamInterruptionType = StreamInterruptionType.NONE
+    error_message: Optional[str] = None
+
+    @property
+    def total_tokens(self) -> int:
+        """Total tokens used."""
+        return self.prompt_tokens + self.completion_tokens + self.thinking_tokens
+
+    @property
+    def time_to_first_token_ms(self) -> float:
+        """Time from start to first chunk in milliseconds."""
+        if self.first_chunk_time == 0 or self.start_time == 0:
+            return 0.0
+        return (self.first_chunk_time - self.start_time) * 1000
+
+    @property
+    def total_duration_ms(self) -> float:
+        """Total streaming duration in milliseconds."""
+        if self.end_time == 0 or self.start_time == 0:
+            return 0.0
+        return (self.end_time - self.start_time) * 1000
+
+    @property
+    def tokens_per_second(self) -> float:
+        """Tokens generated per second."""
+        duration_s = self.total_duration_ms / 1000
+        if duration_s <= 0:
+            return 0.0
+        return self.completion_tokens / duration_s
+
+    def to_dict(self) -> dict:
+        """Convert stats to dictionary for logging."""
+        return {
+            "total_chunks": self.total_chunks,
+            "content_length": self.content_length,
+            "thinking_length": self.thinking_length,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "thinking_tokens": self.thinking_tokens,
+            "total_tokens": self.total_tokens,
+            "time_to_first_token_ms": round(self.time_to_first_token_ms, 2),
+            "total_duration_ms": round(self.total_duration_ms, 2),
+            "tokens_per_second": round(self.tokens_per_second, 2),
+            "interrupted": self.interrupted,
+            "interruption_type": self.interruption_type.value if self.interrupted else None,
+        }
+
+
 class ThinkingMode(Enum):
     """GLM-4.7 thinking modes."""
     DISABLED = "disabled"
     ENABLED = "enabled"
     PRESERVED = "preserved"  # Keeps thinking across turns
+
+
+class ReasoningFailureType(Enum):
+    """Types of reasoning failures that can trigger fallback."""
+    NONE = "none"  # No failure
+    BUDGET_EXHAUSTED = "budget_exhausted"  # Thinking budget fully consumed
+    EMPTY_THINKING = "empty_thinking"  # Thinking enabled but no reasoning returned
+    API_ERROR = "api_error"  # API returned an error during thinking
+    TIMEOUT = "timeout"  # Request timed out during reasoning
+    MALFORMED_RESPONSE = "malformed_response"  # Response format unexpected
+    TRUNCATED_OUTPUT = "truncated_output"  # Output appears cut off
+
+
+@dataclass
+class ReasoningMetrics:
+    """Metrics for reasoning/thinking operations.
+
+    Tracks performance and success rates for thinking mode operations.
+    Useful for monitoring and debugging reasoning quality.
+    """
+    total_requests: int = 0
+    thinking_requests: int = 0
+    fallback_requests: int = 0
+    successful_thinking: int = 0
+    failed_thinking: int = 0
+    total_thinking_tokens: int = 0
+    total_thinking_budget: int = 0
+    budget_exhausted_count: int = 0
+    empty_thinking_count: int = 0
+    api_error_count: int = 0
+    timeout_count: int = 0
+
+    @property
+    def thinking_success_rate(self) -> float:
+        """Percentage of thinking requests that succeeded."""
+        if self.thinking_requests == 0:
+            return 100.0
+        return (self.successful_thinking / self.thinking_requests) * 100
+
+    @property
+    def fallback_rate(self) -> float:
+        """Percentage of requests that fell back to non-thinking mode."""
+        if self.total_requests == 0:
+            return 0.0
+        return (self.fallback_requests / self.total_requests) * 100
+
+    @property
+    def avg_budget_utilization(self) -> float:
+        """Average percentage of thinking budget used."""
+        if self.total_thinking_budget == 0:
+            return 0.0
+        return (self.total_thinking_tokens / self.total_thinking_budget) * 100
+
+    def to_dict(self) -> dict:
+        """Convert metrics to dictionary for logging/serialization."""
+        return {
+            "total_requests": self.total_requests,
+            "thinking_requests": self.thinking_requests,
+            "fallback_requests": self.fallback_requests,
+            "thinking_success_rate_pct": round(self.thinking_success_rate, 2),
+            "fallback_rate_pct": round(self.fallback_rate, 2),
+            "avg_budget_utilization_pct": round(self.avg_budget_utilization, 2),
+            "budget_exhausted_count": self.budget_exhausted_count,
+            "empty_thinking_count": self.empty_thinking_count,
+            "api_error_count": self.api_error_count,
+            "timeout_count": self.timeout_count,
+        }
 
 
 @dataclass
@@ -54,13 +288,29 @@ class TokenUsage:
     completion_tokens: int = 0
     thinking_tokens: int = 0
     total_tokens: int = 0
+    thinking_budget: int = 0  # Allocated thinking budget
 
     @property
     def cost_usd(self) -> float:
-        """Calculate cost in USD."""
+        """Calculate cost in USD (Z.ai Coding Plan rates)."""
         input_cost = (self.prompt_tokens / 1_000_000) * 0.60
         output_cost = ((self.completion_tokens + self.thinking_tokens) / 1_000_000) * 2.20
         return input_cost + output_cost
+
+    @property
+    def thinking_budget_used_pct(self) -> float:
+        """Percentage of thinking budget used."""
+        if self.thinking_budget <= 0:
+            return 0.0
+        return min(100.0, (self.thinking_tokens / self.thinking_budget) * 100)
+
+    @property
+    def thinking_budget_exhausted(self) -> bool:
+        """Check if thinking budget was fully consumed (reasoning may be truncated)."""
+        if self.thinking_budget <= 0:
+            return False
+        # Consider exhausted if >95% used (buffer for estimation variance)
+        return self.thinking_tokens >= (self.thinking_budget * 0.95)
 
 
 @dataclass
@@ -72,10 +322,41 @@ class GLMResponse:
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str = "glm-4.7"
     latency_ms: float = 0.0
+    thinking_budget_used: int = 0  # How many thinking tokens were used
+    # Fallback-related fields
+    used_fallback: bool = False  # True if fell back to non-thinking mode
+    fallback_reason: ReasoningFailureType = ReasoningFailureType.NONE
+    original_error: Optional[str] = None  # Error message if fallback was triggered
 
     @property
     def has_thinking(self) -> bool:
+        """Check if response includes thinking content."""
         return self.thinking is not None and len(self.thinking) > 0
+
+    @property
+    def thinking_truncated(self) -> bool:
+        """Check if thinking may have been truncated due to budget limits."""
+        return self.usage.thinking_budget_exhausted
+
+    @property
+    def reasoning_quality(self) -> str:
+        """Assess the quality of reasoning in this response.
+
+        Returns:
+            'excellent': Full thinking with budget room to spare
+            'good': Thinking completed but used significant budget
+            'degraded': Budget exhausted, reasoning may be incomplete
+            'failed': No thinking (fallback used or disabled)
+        """
+        if self.used_fallback:
+            return "failed"
+        if not self.has_thinking:
+            return "failed"
+        if self.thinking_truncated:
+            return "degraded"
+        if self.usage.thinking_budget_used_pct > 80:
+            return "good"
+        return "excellent"
 
 
 # API Endpoints
@@ -95,6 +376,7 @@ class GLMConfig:
     top_p: float = 0.95
     timeout: int = 120
     thinking_mode: ThinkingMode = ThinkingMode.ENABLED
+    thinking_budget: int = 16000  # Max reasoning tokens (default 16K for GLM-4.7)
 
     @classmethod
     def from_env(cls, use_coding_endpoint: bool = True) -> "GLMConfig":
@@ -108,6 +390,7 @@ class GLMConfig:
             ZAI_BASE_URL: Override base URL
             ZAI_USE_CODING: Set to "false" to use general endpoint
             GLM_MODEL: Model name (default glm-4.7)
+            GLM_THINKING_BUDGET: Max reasoning tokens (default 16000)
         """
         # Check env var for endpoint preference
         env_use_coding = os.getenv("ZAI_USE_CODING", "true").lower() != "false"
@@ -117,11 +400,15 @@ class GLMConfig:
         default_url = CODING_BASE_URL if use_coding else GENERAL_BASE_URL
         base_url = os.getenv("ZAI_BASE_URL", default_url)
 
+        # Get thinking budget from env (default 16K)
+        thinking_budget = int(os.getenv("GLM_THINKING_BUDGET", "16000"))
+
         return cls(
             api_key=os.getenv("ZAI_API_KEY", os.getenv("GLM_API_KEY", "")),
             base_url=base_url,
             model=os.getenv("GLM_MODEL", "glm-4.7"),
             use_coding_endpoint=use_coding,
+            thinking_budget=thinking_budget,
         )
 
 
@@ -161,6 +448,7 @@ class GLMClient:
 
         self._session = None
         self._total_usage = TokenUsage()
+        self._reasoning_metrics = ReasoningMetrics()
 
     @property
     def headers(self) -> dict:
@@ -180,6 +468,7 @@ class GLMClient:
         messages: list[dict],
         thinking: bool = True,
         preserve_thinking: bool = False,
+        thinking_budget: Optional[int] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         stream: bool = False,
@@ -191,6 +480,7 @@ class GLMClient:
             messages: List of messages in OpenAI format
             thinking: Enable thinking mode
             preserve_thinking: Keep thinking across turns (for agents)
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
             max_tokens: Override max tokens
             temperature: Override temperature
             stream: Enable streaming (returns iterator)
@@ -209,16 +499,25 @@ class GLMClient:
             "stream": stream,
         }
 
-        # Configure thinking mode
+        # Use provided budget or config default
+        budget = thinking_budget or self.config.thinking_budget
+
+        # Configure thinking mode with budget_tokens (Z.ai format)
         if thinking:
             if preserve_thinking:
-                payload["thinking"] = {"type": "enabled"}
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
                 payload["chat_template_kwargs"] = {
                     "enable_thinking": True,
                     "clear_thinking": False,  # Preserve across turns
                 }
             else:
-                payload["thinking"] = {"type": "enabled"}
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
         else:
             payload["thinking"] = {"type": "disabled"}
 
@@ -238,7 +537,279 @@ class GLMClient:
         if stream:
             return self._parse_stream(response, latency_ms)
         else:
-            return self._parse_response(response, latency_ms)
+            # Pass the thinking budget for tracking
+            return self._parse_response(
+                response, latency_ms, thinking_budget=budget if thinking else 0
+            )
+
+    def generate_with_fallback(
+        self,
+        messages: list[dict],
+        thinking_budget: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        auto_increase_budget: bool = False,
+        **kwargs,
+    ) -> GLMResponse:
+        """Generate response with automatic fallback on reasoning failure.
+
+        Tries thinking mode first. If reasoning fails or is truncated,
+        automatically retries without thinking mode to ensure a response.
+
+        Args:
+            messages: List of messages in OpenAI format
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
+            max_tokens: Override max tokens
+            temperature: Override temperature
+            auto_increase_budget: If True and budget exhausted, retry with 2x budget
+                                  before falling back to non-thinking
+            **kwargs: Additional parameters
+
+        Returns:
+            GLMResponse with content. Check used_fallback and fallback_reason
+            to determine if fallback was triggered.
+
+        Example:
+            response = client.generate_with_fallback(
+                messages=[{"role": "user", "content": "Explain this code"}],
+                thinking_budget=16000
+            )
+            if response.used_fallback:
+                print(f"Fallback used: {response.fallback_reason.value}")
+            else:
+                print(f"Reasoning quality: {response.reasoning_quality}")
+        """
+        budget = thinking_budget or self.config.thinking_budget
+
+        # Update metrics
+        self._reasoning_metrics.total_requests += 1
+        self._reasoning_metrics.thinking_requests += 1
+
+        # First attempt: with thinking
+        try:
+            response = self.generate(
+                messages=messages,
+                thinking=True,
+                thinking_budget=budget,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=False,
+                **kwargs,
+            )
+
+            # Check for reasoning failure
+            failure_type = self._detect_reasoning_failure(response)
+
+            if failure_type == ReasoningFailureType.NONE:
+                # Success - log and return
+                self._reasoning_metrics.successful_thinking += 1
+                self._reasoning_metrics.total_thinking_tokens += response.usage.thinking_tokens
+                self._reasoning_metrics.total_thinking_budget += budget
+                self._log_reasoning_metrics(response, "success")
+                return response
+
+            # Handle budget exhaustion with optional retry at higher budget
+            if failure_type == ReasoningFailureType.BUDGET_EXHAUSTED:
+                self._reasoning_metrics.budget_exhausted_count += 1
+
+                if auto_increase_budget and budget < 64000:
+                    # Retry with 2x budget before giving up
+                    new_budget = min(budget * 2, 64000)
+                    logger.info(
+                        f"Reasoning budget exhausted ({budget} tokens). "
+                        f"Retrying with increased budget ({new_budget} tokens)."
+                    )
+                    return self.generate_with_fallback(
+                        messages=messages,
+                        thinking_budget=new_budget,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        auto_increase_budget=False,  # Only retry once
+                        **kwargs,
+                    )
+
+                # Budget exhausted but response exists - return with warning
+                self._reasoning_metrics.failed_thinking += 1
+                self._log_reasoning_metrics(
+                    response, "degraded", f"budget_exhausted ({response.usage.thinking_tokens}/{budget})"
+                )
+                return response  # Return degraded response, not fallback
+
+            # Handle empty thinking
+            if failure_type == ReasoningFailureType.EMPTY_THINKING:
+                self._reasoning_metrics.empty_thinking_count += 1
+                logger.warning(
+                    "Thinking mode enabled but no reasoning returned. "
+                    "Falling back to non-thinking mode."
+                )
+
+            # Fallback to non-thinking mode
+            return self._execute_fallback(
+                messages=messages,
+                failure_type=failure_type,
+                original_error=None,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+
+        except Exception as e:
+            # API error or timeout - fallback to non-thinking
+            error_msg = str(e)
+
+            # Categorize the error
+            if "timeout" in error_msg.lower():
+                failure_type = ReasoningFailureType.TIMEOUT
+                self._reasoning_metrics.timeout_count += 1
+            else:
+                failure_type = ReasoningFailureType.API_ERROR
+                self._reasoning_metrics.api_error_count += 1
+
+            logger.warning(
+                f"Thinking request failed with error: {error_msg}. "
+                f"Falling back to non-thinking mode."
+            )
+
+            return self._execute_fallback(
+                messages=messages,
+                failure_type=failure_type,
+                original_error=error_msg,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+
+    def _detect_reasoning_failure(self, response: GLMResponse) -> ReasoningFailureType:
+        """Detect type of reasoning failure in a response.
+
+        Args:
+            response: GLMResponse to analyze
+
+        Returns:
+            ReasoningFailureType indicating the failure (or NONE if successful)
+        """
+        # Check for budget exhaustion (may still have valid response)
+        if response.thinking_truncated:
+            return ReasoningFailureType.BUDGET_EXHAUSTED
+
+        # Check for empty thinking when it was expected
+        if not response.has_thinking and response.usage.thinking_budget > 0:
+            # Thinking was enabled but no reasoning returned
+            return ReasoningFailureType.EMPTY_THINKING
+
+        # Check for truncated output (finish_reason indicates cutoff)
+        if response.finish_reason == "length":
+            return ReasoningFailureType.TRUNCATED_OUTPUT
+
+        # Check for malformed/empty content
+        if not response.content or not response.content.strip():
+            return ReasoningFailureType.MALFORMED_RESPONSE
+
+        return ReasoningFailureType.NONE
+
+    def _execute_fallback(
+        self,
+        messages: list[dict],
+        failure_type: ReasoningFailureType,
+        original_error: Optional[str],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        **kwargs,
+    ) -> GLMResponse:
+        """Execute fallback request without thinking mode.
+
+        Args:
+            messages: List of messages
+            failure_type: Why fallback was triggered
+            original_error: Original error message if any
+            max_tokens: Override max tokens
+            temperature: Override temperature
+            **kwargs: Additional parameters
+
+        Returns:
+            GLMResponse with fallback information
+        """
+        self._reasoning_metrics.failed_thinking += 1
+        self._reasoning_metrics.fallback_requests += 1
+
+        try:
+            # Make request without thinking
+            response = self.generate(
+                messages=messages,
+                thinking=False,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=False,
+                **kwargs,
+            )
+
+            # Mark as fallback
+            response.used_fallback = True
+            response.fallback_reason = failure_type
+            response.original_error = original_error
+
+            self._log_reasoning_metrics(
+                response, "fallback", f"{failure_type.value}: {original_error or 'N/A'}"
+            )
+
+            return response
+
+        except Exception as e:
+            # Even fallback failed - create error response
+            logger.error(f"Fallback request also failed: {e}")
+            raise
+
+    def _log_reasoning_metrics(
+        self,
+        response: GLMResponse,
+        status: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Log reasoning metrics for observability.
+
+        Args:
+            response: The GLMResponse
+            status: 'success', 'degraded', or 'fallback'
+            detail: Optional detail message
+        """
+        metrics = {
+            "status": status,
+            "thinking_tokens": response.usage.thinking_tokens,
+            "thinking_budget": response.usage.thinking_budget,
+            "budget_used_pct": round(response.usage.thinking_budget_used_pct, 1),
+            "latency_ms": round(response.latency_ms, 1),
+            "model": response.model,
+        }
+
+        if detail:
+            metrics["detail"] = detail
+
+        if response.used_fallback:
+            metrics["fallback_reason"] = response.fallback_reason.value
+
+        if status == "success":
+            logger.debug(f"Reasoning metrics: {metrics}")
+        elif status == "degraded":
+            logger.warning(f"Reasoning degraded: {metrics}")
+        else:
+            logger.info(f"Reasoning fallback: {metrics}")
+
+    def get_reasoning_metrics(self) -> ReasoningMetrics:
+        """Get cumulative reasoning metrics.
+
+        Returns:
+            ReasoningMetrics with statistics about thinking operations
+        """
+        return self._reasoning_metrics
+
+    def reset_reasoning_metrics(self) -> None:
+        """Reset reasoning metrics to initial state."""
+        self._reasoning_metrics = ReasoningMetrics()
+
+    def log_reasoning_summary(self) -> None:
+        """Log a summary of reasoning metrics."""
+        metrics = self._reasoning_metrics.to_dict()
+        logger.info(f"Reasoning summary: {json.dumps(metrics, indent=2)}")
 
     def _request_httpx(self, payload: dict, stream: bool) -> Any:
         """Make request using httpx."""
@@ -262,28 +833,43 @@ class GLMClient:
         response.raise_for_status()
         return response.json()
 
-    def _parse_response(self, data: dict, latency_ms: float) -> GLMResponse:
-        """Parse API response into GLMResponse."""
+    def _parse_response(
+        self, data: dict, latency_ms: float, thinking_budget: int = 0
+    ) -> GLMResponse:
+        """Parse API response into GLMResponse.
+
+        Args:
+            data: Raw API response data
+            latency_ms: Request latency in milliseconds
+            thinking_budget: The thinking budget that was used for this request
+        """
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
 
-        # Extract content and thinking
+        # Extract content and thinking (GLM-4.7 uses reasoning_content)
         content = message.get("content", "")
         thinking = None
 
-        # Check for thinking in message
+        # Check for thinking in message (GLM-4.7 format: reasoning_content)
         if "thinking" in message:
             thinking = message["thinking"]
         elif "reasoning_content" in message:
             thinking = message["reasoning_content"]
 
-        # Parse usage
+        # GLM-4.7: If content is empty but reasoning exists, use reasoning as content
+        # This is a known behavior of GLM thinking models
+        if not content and thinking:
+            content = thinking
+
+        # Parse usage with thinking_budget tracking
         usage_data = data.get("usage", {})
+        thinking_tokens = usage_data.get("thinking_tokens", 0)
         usage = TokenUsage(
             prompt_tokens=usage_data.get("prompt_tokens", 0),
             completion_tokens=usage_data.get("completion_tokens", 0),
-            thinking_tokens=usage_data.get("thinking_tokens", 0),
+            thinking_tokens=thinking_tokens,
             total_tokens=usage_data.get("total_tokens", 0),
+            thinking_budget=thinking_budget,  # Track allocated budget
         )
 
         # Track cumulative usage
@@ -291,6 +877,7 @@ class GLMClient:
         self._total_usage.completion_tokens += usage.completion_tokens
         self._total_usage.thinking_tokens += usage.thinking_tokens
         self._total_usage.total_tokens += usage.total_tokens
+        self._total_usage.thinking_budget += thinking_budget
 
         return GLMResponse(
             content=content,
@@ -299,19 +886,567 @@ class GLMClient:
             usage=usage,
             model=data.get("model", self.config.model),
             latency_ms=latency_ms,
+            thinking_budget_used=thinking_tokens,  # Track actual usage
         )
 
     def _parse_stream(self, response: Any, latency_ms: float) -> Iterator[str]:
-        """Parse streaming response."""
+        """Parse streaming response (sync version).
+
+        Note: For better streaming support, use generate_stream_async().
+        """
         # Streaming implementation would go here
         # For now, yield the full response
         yield response.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    # =========================================================================
+    # Async Streaming Support
+    # =========================================================================
+
+    async def generate_stream_async(
+        self,
+        messages: list[dict],
+        thinking: bool = True,
+        preserve_thinking: bool = False,
+        thinking_budget: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> AsyncIterator[StreamChunk]:
+        """Generate a streaming response from GLM-4.7 asynchronously.
+
+        Yields StreamChunk objects as they arrive, with proper token counting
+        and interruption handling.
+
+        Args:
+            messages: List of messages in OpenAI format
+            thinking: Enable thinking mode
+            preserve_thinking: Keep thinking across turns (for agents)
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
+            max_tokens: Override max tokens
+            temperature: Override temperature
+            timeout: Timeout for the streaming connection (default: config.timeout)
+            **kwargs: Additional parameters
+
+        Yields:
+            StreamChunk objects containing content, thinking, and metadata
+
+        Raises:
+            RuntimeError: If httpx is not available
+
+        Example:
+            async for chunk in client.generate_stream_async(messages):
+                if chunk.content:
+                    print(chunk.content, end="", flush=True)
+                if chunk.is_final:
+                    print(f"\\nTokens: {chunk.completion_tokens}")
+        """
+        if not HTTPX_AVAILABLE:
+            raise RuntimeError(
+                "Async streaming requires httpx. Install it with: pip install httpx"
+            )
+
+        # Build request payload
+        budget = thinking_budget or self.config.thinking_budget
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "max_tokens": max_tokens or self.config.max_tokens,
+            "temperature": temperature or self.config.temperature,
+            "top_p": self.config.top_p,
+            "stream": True,  # Enable streaming
+        }
+
+        # Configure thinking mode with budget_tokens (Z.ai format)
+        if thinking:
+            if preserve_thinking:
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
+                payload["chat_template_kwargs"] = {
+                    "enable_thinking": True,
+                    "clear_thinking": False,
+                }
+            else:
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
+        else:
+            payload["thinking"] = {"type": "disabled"}
+
+        # Add any extra parameters
+        payload.update(kwargs)
+
+        # Initialize stats
+        stats = StreamingStats(start_time=time.time())
+        chunk_index = 0
+        accumulated_content = ""
+        accumulated_thinking = ""
+        stream_timeout = timeout or self.config.timeout
+
+        try:
+            async with httpx.AsyncClient(timeout=stream_timeout) as client:
+                async with client.stream(
+                    "POST",
+                    self.endpoint,
+                    headers=self.headers,
+                    json=payload,
+                ) as response:
+                    # Check for HTTP errors
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        error_msg = f"HTTP {response.status_code}: {error_text.decode()}"
+                        logger.error(f"Stream request failed: {error_msg}")
+                        yield StreamChunk(
+                            interrupted=True,
+                            interruption_type=StreamInterruptionType.SERVER_ERROR,
+                            error_message=error_msg,
+                            is_final=True,
+                        )
+                        return
+
+                    # Process SSE stream
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+
+                        # Parse SSE event
+                        chunk = self._parse_sse_line(
+                            line,
+                            chunk_index,
+                            stats,
+                            accumulated_content,
+                            accumulated_thinking,
+                            thinking_budget=budget if thinking else 0,
+                        )
+
+                        if chunk is None:
+                            continue
+
+                        # Update stats
+                        if chunk_index == 0 and stats.first_chunk_time == 0:
+                            stats.first_chunk_time = time.time()
+
+                        if chunk.content:
+                            accumulated_content += chunk.content
+                            stats.content_length += len(chunk.content)
+
+                        if chunk.thinking:
+                            accumulated_thinking += chunk.thinking
+                            stats.thinking_length += len(chunk.thinking)
+
+                        chunk_index += 1
+                        stats.total_chunks = chunk_index
+
+                        yield chunk
+
+                        # Check for final chunk
+                        if chunk.is_final:
+                            stats.end_time = time.time()
+                            stats.prompt_tokens = chunk.prompt_tokens
+                            stats.completion_tokens = chunk.completion_tokens
+                            stats.thinking_tokens = chunk.thinking_tokens
+                            self._log_streaming_stats(stats)
+                            return
+
+        except asyncio.CancelledError:
+            # Client cancelled the stream
+            logger.info("Stream cancelled by client")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.CLIENT_CANCELLED
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.CLIENT_CANCELLED,
+                is_final=True,
+            )
+
+        except httpx.TimeoutException as e:
+            logger.error(f"Stream timeout: {e}")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.TIMEOUT
+            stats.error_message = str(e)
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.TIMEOUT,
+                error_message=str(e),
+                is_final=True,
+            )
+
+        except httpx.HTTPError as e:
+            logger.error(f"Stream connection error: {e}")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.CONNECTION_ERROR
+            stats.error_message = str(e)
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.CONNECTION_ERROR,
+                error_message=str(e),
+                is_final=True,
+            )
+
+        except Exception as e:
+            logger.error(f"Unexpected stream error: {e}")
+            stats.end_time = time.time()
+            stats.interrupted = True
+            stats.interruption_type = StreamInterruptionType.SERVER_ERROR
+            stats.error_message = str(e)
+            yield StreamChunk(
+                content=accumulated_content,
+                thinking=accumulated_thinking,
+                chunk_index=chunk_index,
+                interrupted=True,
+                interruption_type=StreamInterruptionType.SERVER_ERROR,
+                error_message=str(e),
+                is_final=True,
+            )
+
+    def _parse_sse_line(
+        self,
+        line: str,
+        chunk_index: int,
+        stats: StreamingStats,
+        accumulated_content: str,
+        accumulated_thinking: str,
+        thinking_budget: int = 0,
+    ) -> Optional[StreamChunk]:
+        """Parse a single SSE line from the stream.
+
+        Args:
+            line: Raw SSE line (e.g., "data: {...}")
+            chunk_index: Current chunk index
+            stats: Streaming stats to update
+            accumulated_content: Content accumulated so far
+            accumulated_thinking: Thinking accumulated so far
+            thinking_budget: The thinking budget used for this request
+
+        Returns:
+            StreamChunk if the line contains valid data, None otherwise
+        """
+        # SSE format: "data: {json}" or "data: [DONE]"
+        if not line.startswith("data:"):
+            return None
+
+        data_str = line[5:].strip()
+
+        # Check for stream end marker
+        if data_str == "[DONE]":
+            return StreamChunk(
+                content="",
+                thinking="",
+                finish_reason="stop",
+                is_final=True,
+                chunk_index=chunk_index,
+                prompt_tokens=stats.prompt_tokens,
+                completion_tokens=stats.completion_tokens,
+                thinking_tokens=stats.thinking_tokens,
+            )
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse SSE data: {e}")
+            return StreamChunk(
+                interrupted=True,
+                interruption_type=StreamInterruptionType.MALFORMED_DATA,
+                error_message=f"JSON decode error: {e}",
+                chunk_index=chunk_index,
+            )
+
+        # Extract content from the chunk
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        finish_reason = choice.get("finish_reason")
+
+        content = delta.get("content", "")
+        thinking = delta.get("thinking", "") or delta.get("reasoning_content", "")
+
+        # Update token counts from usage if available (usually in final chunk)
+        usage = data.get("usage", {})
+        if usage:
+            stats.prompt_tokens = usage.get("prompt_tokens", stats.prompt_tokens)
+            stats.completion_tokens = usage.get("completion_tokens", stats.completion_tokens)
+            stats.thinking_tokens = usage.get("thinking_tokens", stats.thinking_tokens)
+
+        # Calculate timing
+        latency_ms = 0.0
+        if stats.start_time > 0:
+            latency_ms = (time.time() - stats.start_time) * 1000
+
+        return StreamChunk(
+            content=content,
+            thinking=thinking,
+            finish_reason=finish_reason,
+            is_final=finish_reason is not None,
+            chunk_index=chunk_index,
+            prompt_tokens=stats.prompt_tokens,
+            completion_tokens=stats.completion_tokens,
+            thinking_tokens=stats.thinking_tokens,
+            latency_ms=latency_ms,
+        )
+
+    def _log_streaming_stats(self, stats: StreamingStats) -> None:
+        """Log streaming statistics."""
+        metrics = stats.to_dict()
+        if stats.interrupted:
+            logger.warning(f"Stream interrupted: {metrics}")
+        else:
+            logger.debug(f"Stream completed: {metrics}")
+
+    async def stream_code_analysis(
+        self,
+        code: str,
+        language: str = "python",
+        analysis_type: str = "comprehensive",
+        thinking_budget: Optional[int] = None,
+        timeout: Optional[float] = None,
+        on_chunk: Optional[callable] = None,
+    ) -> tuple[GLMResponse, StreamingStats]:
+        """Stream code analysis for long-running analysis tasks.
+
+        This is a convenience method for streaming code analysis with
+        automatic content accumulation and optional chunk callbacks.
+
+        Args:
+            code: The source code to analyze
+            language: Programming language of the code
+            analysis_type: Type of analysis ("comprehensive", "security", "performance")
+            thinking_budget: Max reasoning tokens (default: 32000 for analysis)
+            timeout: Timeout for the analysis (default: 300 seconds for long analysis)
+            on_chunk: Optional callback called for each chunk: on_chunk(chunk: StreamChunk)
+
+        Returns:
+            Tuple of (GLMResponse with complete analysis, StreamingStats)
+
+        Example:
+            async def print_progress(chunk):
+                if chunk.content:
+                    print(chunk.content, end="", flush=True)
+
+            response, stats = await client.stream_code_analysis(
+                code=source_code,
+                language="python",
+                on_chunk=print_progress
+            )
+            print(f"\\n\\nAnalysis took {stats.total_duration_ms:.0f}ms")
+        """
+        # Use higher defaults for long-running analysis
+        budget = thinking_budget or 32000
+        stream_timeout = timeout or 300.0  # 5 minutes for comprehensive analysis
+
+        # Build analysis prompt based on type
+        analysis_prompts = {
+            "comprehensive": """Provide a comprehensive code analysis including:
+1. Overall architecture and design patterns
+2. Function-by-function breakdown
+3. Data flow analysis
+4. Error handling assessment
+5. Performance considerations
+6. Security implications
+7. Recommendations for improvement""",
+            "security": """Perform a security-focused code analysis:
+1. Identify potential security vulnerabilities
+2. Check for injection risks (SQL, XSS, command injection)
+3. Assess authentication and authorization patterns
+4. Review sensitive data handling
+5. Check for hardcoded secrets or credentials
+6. Evaluate input validation
+7. Provide remediation recommendations""",
+            "performance": """Analyze code performance:
+1. Identify algorithmic complexity issues
+2. Find potential memory leaks
+3. Detect unnecessary computations
+4. Review database query patterns
+5. Assess caching opportunities
+6. Identify blocking operations
+7. Suggest optimizations with benchmarks""",
+        }
+
+        instruction = analysis_prompts.get(analysis_type, analysis_prompts["comprehensive"])
+
+        system_prompt = f"""You are an expert code analyst specializing in {language}.
+Perform a thorough analysis of the provided code.
+Use your reasoning capabilities to understand the code deeply.
+{instruction}"""
+
+        user_message = f"""Analyze this {language} code:
+
+```{language}
+{code}
+```"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        # Collect streamed response
+        accumulated_content = ""
+        accumulated_thinking = ""
+        final_stats = StreamingStats()
+        final_usage = TokenUsage()
+        finish_reason = "stop"
+        interrupted = False
+        interruption_type = StreamInterruptionType.NONE
+        error_message = None
+
+        logger.info(
+            f"Starting streaming code analysis: language={language}, "
+            f"type={analysis_type}, budget={budget}, timeout={stream_timeout}s"
+        )
+
+        async for chunk in self.generate_stream_async(
+            messages=messages,
+            thinking=True,
+            thinking_budget=budget,
+            timeout=stream_timeout,
+        ):
+            # Call user callback if provided
+            if on_chunk:
+                try:
+                    on_chunk(chunk)
+                except Exception as e:
+                    logger.warning(f"on_chunk callback error: {e}")
+
+            # Accumulate content
+            if chunk.content:
+                accumulated_content += chunk.content
+            if chunk.thinking:
+                accumulated_thinking += chunk.thinking
+
+            # Update stats and check for completion
+            if chunk.is_final:
+                final_usage = TokenUsage(
+                    prompt_tokens=chunk.prompt_tokens,
+                    completion_tokens=chunk.completion_tokens,
+                    thinking_tokens=chunk.thinking_tokens,
+                    total_tokens=chunk.prompt_tokens + chunk.completion_tokens + chunk.thinking_tokens,
+                    thinking_budget=budget,
+                )
+                finish_reason = chunk.finish_reason or "stop"
+                interrupted = chunk.interrupted
+                interruption_type = chunk.interruption_type
+                error_message = chunk.error_message
+
+        # Build final response
+        response = GLMResponse(
+            content=accumulated_content,
+            thinking=accumulated_thinking if accumulated_thinking else None,
+            finish_reason=finish_reason,
+            usage=final_usage,
+            model=self.config.model,
+            latency_ms=final_stats.total_duration_ms,
+        )
+
+        # Build final stats
+        final_stats.content_length = len(accumulated_content)
+        final_stats.thinking_length = len(accumulated_thinking)
+        final_stats.prompt_tokens = final_usage.prompt_tokens
+        final_stats.completion_tokens = final_usage.completion_tokens
+        final_stats.thinking_tokens = final_usage.thinking_tokens
+        final_stats.interrupted = interrupted
+        final_stats.interruption_type = interruption_type
+        final_stats.error_message = error_message
+
+        logger.info(
+            f"Code analysis complete: tokens={final_usage.total_tokens}, "
+            f"duration={final_stats.total_duration_ms:.0f}ms, interrupted={interrupted}"
+        )
+
+        return response, final_stats
+
+    async def collect_stream(
+        self,
+        messages: list[dict],
+        thinking: bool = True,
+        thinking_budget: Optional[int] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> GLMResponse:
+        """Collect a streaming response into a single GLMResponse.
+
+        This is useful when you want async streaming behavior (for timeouts
+        and cancellation) but don't need to process chunks individually.
+
+        Args:
+            messages: List of messages in OpenAI format
+            thinking: Enable thinking mode
+            thinking_budget: Max tokens for reasoning
+            timeout: Timeout for the streaming connection
+            **kwargs: Additional parameters passed to generate_stream_async
+
+        Returns:
+            GLMResponse with accumulated content
+        """
+        accumulated_content = ""
+        accumulated_thinking = ""
+        final_usage = TokenUsage()
+        finish_reason = "stop"
+        start_time = time.time()
+
+        async for chunk in self.generate_stream_async(
+            messages=messages,
+            thinking=thinking,
+            thinking_budget=thinking_budget,
+            timeout=timeout,
+            **kwargs,
+        ):
+            if chunk.content:
+                accumulated_content += chunk.content
+            if chunk.thinking:
+                accumulated_thinking += chunk.thinking
+
+            if chunk.is_final:
+                budget = thinking_budget or self.config.thinking_budget
+                final_usage = TokenUsage(
+                    prompt_tokens=chunk.prompt_tokens,
+                    completion_tokens=chunk.completion_tokens,
+                    thinking_tokens=chunk.thinking_tokens,
+                    total_tokens=chunk.prompt_tokens + chunk.completion_tokens + chunk.thinking_tokens,
+                    thinking_budget=budget if thinking else 0,
+                )
+                finish_reason = chunk.finish_reason or "stop"
+
+                if chunk.interrupted:
+                    logger.warning(
+                        f"Stream interrupted: {chunk.interruption_type.value} - "
+                        f"{chunk.error_message or 'No details'}"
+                    )
+
+        latency_ms = (time.time() - start_time) * 1000
+
+        return GLMResponse(
+            content=accumulated_content,
+            thinking=accumulated_thinking if accumulated_thinking else None,
+            finish_reason=finish_reason,
+            usage=final_usage,
+            model=self.config.model,
+            latency_ms=latency_ms,
+        )
 
     def chat(
         self,
         user_message: str,
         system_prompt: Optional[str] = None,
         thinking: bool = True,
+        thinking_budget: Optional[int] = None,
     ) -> GLMResponse:
         """Simple chat interface.
 
@@ -319,6 +1454,7 @@ class GLMClient:
             user_message: User's message
             system_prompt: Optional system prompt
             thinking: Enable thinking mode
+            thinking_budget: Max tokens for reasoning (uses config default if not set)
 
         Returns:
             GLMResponse
@@ -330,7 +1466,7 @@ class GLMClient:
 
         messages.append({"role": "user", "content": user_message})
 
-        return self.generate(messages, thinking=thinking)
+        return self.generate(messages, thinking=thinking, thinking_budget=thinking_budget)
 
     def code_generation(
         self,
@@ -361,6 +1497,128 @@ Follow best practices for {language}."""
             system_prompt=system_prompt,
             thinking=True,
         )
+
+    def explain_code(
+        self,
+        code: str,
+        language: str = "python",
+        thinking_budget: Optional[int] = None,
+        detail_level: str = "comprehensive",
+        use_fallback: bool = False,
+        auto_increase_budget: bool = False,
+    ) -> GLMResponse:
+        """Explain code using GLM-4.7 with thinking mode.
+
+        Uses extended thinking budget to provide deep code analysis.
+        This is a reasoning-intensive task that benefits from higher thinking budgets.
+
+        Args:
+            code: The source code to explain
+            language: Programming language of the code
+            thinking_budget: Max reasoning tokens (default: 24000 for explanation tasks)
+            detail_level: "brief", "moderate", or "comprehensive"
+            use_fallback: If True, use generate_with_fallback for automatic
+                         fallback to non-thinking mode on failures
+            auto_increase_budget: If True with use_fallback, retry with 2x budget
+                                  before falling back to non-thinking
+
+        Returns:
+            GLMResponse with explanation and thinking process
+
+        Example:
+            response = client.explain_code(
+                code=\"\"\"
+                def quicksort(arr):
+                    if len(arr) <= 1:
+                        return arr
+                    pivot = arr[len(arr) // 2]
+                    left = [x for x in arr if x < pivot]
+                    middle = [x for x in arr if x == pivot]
+                    right = [x for x in arr if x > pivot]
+                    return quicksort(left) + middle + quicksort(right)
+                \"\"\",
+                language="python",
+                thinking_budget=32000,
+                use_fallback=True  # Automatically fallback if reasoning fails
+            )
+            print(f"Thinking used: {response.usage.thinking_budget_used_pct:.1f}%")
+            if response.used_fallback:
+                print(f"Fallback reason: {response.fallback_reason.value}")
+            print(response.content)
+        """
+        # Use higher default budget for explanation tasks (reasoning-heavy)
+        budget = thinking_budget or 24000
+
+        # Customize prompt based on detail level
+        detail_instructions = {
+            "brief": "Provide a concise summary of what this code does (2-3 sentences).",
+            "moderate": "Explain the code's purpose, key functions, and general flow.",
+            "comprehensive": """Provide a comprehensive explanation including:
+1. Overall purpose and functionality
+2. Step-by-step breakdown of the logic
+3. Key data structures and algorithms used
+4. Potential edge cases or limitations
+5. Suggestions for improvement (if applicable)""",
+        }
+
+        instruction = detail_instructions.get(detail_level, detail_instructions["comprehensive"])
+
+        system_prompt = f"""You are an expert code analyst specializing in {language}.
+Your task is to explain code clearly and thoroughly.
+Use your thinking process to analyze the code deeply before explaining.
+{instruction}"""
+
+        user_message = f"""Please explain this {language} code:
+
+```{language}
+{code}
+```"""
+
+        # Log the reasoning task
+        logger.debug(
+            f"explain_code: language={language}, detail={detail_level}, "
+            f"budget={budget}, code_len={len(code)}, use_fallback={use_fallback}"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        # Use fallback method if requested
+        if use_fallback:
+            response = self.generate_with_fallback(
+                messages=messages,
+                thinking_budget=budget,
+                auto_increase_budget=auto_increase_budget,
+            )
+        else:
+            response = self.generate(
+                messages=messages,
+                thinking=True,
+                thinking_budget=budget,
+            )
+
+        # Log thinking metrics
+        if response.used_fallback:
+            logger.info(
+                f"explain_code: Used fallback mode. "
+                f"Reason: {response.fallback_reason.value}. "
+                f"Original error: {response.original_error or 'N/A'}"
+            )
+        elif response.usage.thinking_budget_exhausted:
+            logger.warning(
+                f"explain_code: Thinking budget exhausted "
+                f"({response.usage.thinking_tokens}/{budget} tokens). "
+                f"Response may be truncated. Consider increasing thinking_budget."
+            )
+        else:
+            logger.debug(
+                f"explain_code: Thinking used {response.usage.thinking_budget_used_pct:.1f}% "
+                f"of budget ({response.usage.thinking_tokens}/{budget} tokens)"
+            )
+
+        return response
 
     def get_total_usage(self) -> TokenUsage:
         """Get cumulative token usage."""
@@ -587,23 +1845,48 @@ class GLMCodingAgent:
 
     Maintains conversation history and thinking state
     across multiple turns for complex coding tasks.
+
+    Example:
+        agent = GLMCodingAgent(thinking_budget=32000)
+        response = agent.send("Explain how this code works")
+        print(f"Thinking used: {response.thinking_budget_used} tokens")
+        print(f"Response: {response.content}")
+
+        # With automatic fallback on reasoning failures
+        agent = GLMCodingAgent(thinking_budget=16000, use_fallback=True)
+        response = agent.send("Explain this complex algorithm")
+        if response.used_fallback:
+            print(f"Fallback triggered: {response.fallback_reason.value}")
     """
 
     def __init__(
         self,
         client: Optional[GLMClient] = None,
         system_prompt: Optional[str] = None,
+        thinking_budget: int = 16000,
+        use_fallback: bool = False,
+        auto_increase_budget: bool = False,
     ):
         """Initialize coding agent.
 
         Args:
             client: GLM client instance
             system_prompt: Custom system prompt
+            thinking_budget: Max tokens for reasoning per turn (default 16K)
+            use_fallback: If True, automatically fallback to non-thinking mode
+                         when reasoning fails
+            auto_increase_budget: If True with use_fallback, retry with 2x budget
+                                  before falling back
         """
         self.client = client or GLMClient()
         self.system_prompt = system_prompt or self._default_system_prompt()
+        self.thinking_budget = thinking_budget
+        self.use_fallback = use_fallback
+        self.auto_increase_budget = auto_increase_budget
         self.messages: list[dict] = []
         self.thinking_history: list[str] = []
+        self.total_thinking_tokens: int = 0  # Track cumulative thinking usage
+        self.fallback_count: int = 0  # Track how many times fallback was used
 
         # Initialize with system prompt
         self.messages.append({
@@ -632,12 +1915,17 @@ Think step by step before providing solutions."""
         self,
         message: str,
         preserve_thinking: bool = True,
+        thinking_budget: Optional[int] = None,
+        use_fallback: Optional[bool] = None,
     ) -> GLMResponse:
         """Send a message and get response.
 
         Args:
             message: User message
             preserve_thinking: Keep thinking across turns
+            thinking_budget: Override thinking budget for this turn
+            use_fallback: Override use_fallback setting for this turn
+                         (uses instance default if not specified)
 
         Returns:
             GLMResponse
@@ -648,12 +1936,26 @@ Think step by step before providing solutions."""
             "content": message,
         })
 
+        # Use provided budget or instance default
+        budget = thinking_budget or self.thinking_budget
+
+        # Determine whether to use fallback
+        should_fallback = use_fallback if use_fallback is not None else self.use_fallback
+
         # Generate response
-        response = self.client.generate(
-            messages=self.messages,
-            thinking=True,
-            preserve_thinking=preserve_thinking,
-        )
+        if should_fallback:
+            response = self.client.generate_with_fallback(
+                messages=self.messages,
+                thinking_budget=budget,
+                auto_increase_budget=self.auto_increase_budget,
+            )
+        else:
+            response = self.client.generate(
+                messages=self.messages,
+                thinking=True,
+                preserve_thinking=preserve_thinking,
+                thinking_budget=budget,
+            )
 
         # Add assistant response to history
         self.messages.append({
@@ -664,6 +1966,15 @@ Think step by step before providing solutions."""
         # Track thinking
         if response.thinking:
             self.thinking_history.append(response.thinking)
+        self.total_thinking_tokens += response.thinking_budget_used
+
+        # Track fallback usage
+        if response.used_fallback:
+            self.fallback_count += 1
+            logger.info(
+                f"GLMCodingAgent: Turn {len(self.thinking_history) + self.fallback_count} "
+                f"used fallback. Reason: {response.fallback_reason.value}"
+            )
 
         return response
 
@@ -674,10 +1985,34 @@ Think step by step before providing solutions."""
             "content": self.system_prompt,
         }]
         self.thinking_history = []
+        self.total_thinking_tokens = 0
+        self.fallback_count = 0
 
     def get_conversation(self) -> list[dict]:
         """Get full conversation history."""
         return self.messages.copy()
+
+    def get_thinking_usage(self) -> dict:
+        """Get thinking token usage for this conversation.
+
+        Returns:
+            dict with thinking usage metrics including fallback statistics
+        """
+        total_turns = len(self.thinking_history) + self.fallback_count
+        return {
+            "total_thinking_tokens": self.total_thinking_tokens,
+            "thinking_turns": len(self.thinking_history),
+            "fallback_turns": self.fallback_count,
+            "total_turns": total_turns,
+            "average_per_turn": (
+                self.total_thinking_tokens / len(self.thinking_history)
+                if self.thinking_history else 0
+            ),
+            "fallback_rate_pct": (
+                (self.fallback_count / total_turns * 100)
+                if total_turns > 0 else 0.0
+            ),
+        }
 
 
 # OpenAI-compatible wrapper for drop-in replacement

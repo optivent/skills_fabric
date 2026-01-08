@@ -17,3 +17,6 @@ worktrees
 output/
 test_index.scip
 *.scip
+
+# Auto Claude data directory
+.auto-claude/

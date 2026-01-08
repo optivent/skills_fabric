@@ -25,7 +25,8 @@ class Config:
     glm_model: str = "glm-4.7"
     
     # Limits
-    max_context7_files: int = 50
+    # max_context7_files: 0 means no limit (use ALL available files)
+    max_context7_files: int = 0
     max_skills_per_run: int = 100
     
     def __post_init__(self):

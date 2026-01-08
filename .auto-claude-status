@@ -1,0 +1,25 @@
+{
+  "active": true,
+  "spec": "001-i-need-to-have-the-best-possible-claude-skills-wit",
+  "state": "complete",
+  "subtasks": {
+    "completed": 32,
+    "total": 32,
+    "in_progress": 0,
+    "failed": 0
+  },
+  "phase": {
+    "current": "",
+    "id": 0,
+    "total": 0
+  },
+  "workers": {
+    "active": 0,
+    "max": 1
+  },
+  "session": {
+    "number": 0,
+    "started_at": "2026-01-07T12:53:46.611221"
+  },
+  "last_update": "2026-01-07T12:53:46.613062"
+}
