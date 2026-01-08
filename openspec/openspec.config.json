@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "project": "skills-fabric",
+  "description": "Zero-hallucination Claude skill generation pipeline",
+  "specsDir": "openspec/specs",
+  "changesDir": "openspec/changes",
+  "archiveDir": "openspec/archive",
+  "tools": {
+    "claudeCode": true,
+    "cursor": true,
+    "copilot": true
+  },
+  "conventions": {
+    "proposalFile": "proposal.md",
+    "tasksFile": "tasks.md",
+    "specsFolder": "specs"
+  },
+  "integration": {
+    "bmadDocs": "docs/bmad",
+    "speckitDocs": "docs/speckit"
+  }
+}
